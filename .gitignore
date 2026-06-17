@@ -1,0 +1,17 @@
+# Binaire compilé
+/dnsbench
+dnsbench
+
+# Artefacts de build Swift
+.build/
+*.o
+*.swiftmodule
+
+# macOS
+.DS_Store
+
+# Config interne (perso) — partir de dnsbench.conf.example
+dnsbench.conf
+
+# Rendu HTML d'un run interne (régénérable via --html)
+result.html

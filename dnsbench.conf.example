@@ -1,0 +1,55 @@
+# ============================================================
+#  dnsbench.conf - parameters for the DNS latency probe
+#  Copy this file to dnsbench.conf and edit it for your setup:
+#      cp dnsbench.conf.example dnsbench.conf
+#  Everything variable lives here; the Swift source hard-codes nothing.
+#  Blank lines and anything after "#" are ignored.
+#
+#  This file = your internal resolution stack (+ a light external reference).
+#  To compare PUBLIC resolvers instead (Cloudflare variants, Google, DNS4EU):
+#      ./dnsbench -c examples/public-dns.conf --sort p50
+# ============================================================
+
+# Number of measurements per resolver AND per mode (HIT + MISS).
+rounds = 2000
+
+# Receive timeout in seconds (beyond this: counted as FAIL).
+timeout_sec = 1
+
+# Global default query type, applied to the cache-MISS and to any hit domain
+# below that has no explicit type. A (IPv4) or AAAA (IPv6). Overridable with
+# --qtype on the command line.
+qtype = A
+
+# Base for the cache-MISS: a unique random label is prefixed to every request to
+# force a real recursion. Point it at a zone whose authority YOU control (fast,
+# deterministic NXDOMAIN) - replace example.com with your own infrastructure domain.
+miss_base = example.com
+
+# ============================================================
+#  Cache-HIT domains: "<domain> [A|AAAA]" (one per line).
+#  Type optional, defaults to the global qtype. The HIT loop rotates across this
+#  list (each domain pre-warmed), aggregated per resolver.
+# ============================================================
+[hit_domains]
+www.apple.com
+www.icloud.com
+www.cloudflare.com
+
+# ============================================================
+#  Resolvers to test: "<address>  <name>" (one per line).
+#  List your own internal resolvers below (v4 + matching v6), then keep a light
+#  external reference. Full public panel lives in examples/public-dns.conf.
+# ============================================================
+[resolvers]
+# --- Your internal resolvers (uncomment and set your own addresses) ---
+#192.168.1.10            resolver-1
+#fd00::10                resolver-1-v6
+#192.168.1.11            resolver-2
+#fd00::11                resolver-2-v6
+
+# --- Light external reference ---
+1.1.1.1                  cloudflare
+2606:4700:4700::1111     cloudflare-v6
+8.8.8.8                  google
+2001:4860:4860::8888     google-v6
