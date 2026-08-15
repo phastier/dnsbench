@@ -15,6 +15,9 @@
 #if canImport(Darwin)
 import Darwin
 let SOCK_DGRAM_VAL = SOCK_DGRAM            // Int32 on Darwin
+#elseif canImport(Musl)
+import Musl
+let SOCK_DGRAM_VAL = SOCK_DGRAM            // plain Int32 on Musl (static SDK)
 #elseif canImport(Glibc)
 import Glibc
 let SOCK_DGRAM_VAL = Int32(SOCK_DGRAM.rawValue)   // enum on Glibc
