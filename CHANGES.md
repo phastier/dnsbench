@@ -1,209 +1,223 @@
-*French engineering log. The English deep-dive is [docs/INVESTIGATION.md](docs/INVESTIGATION.md).*
+*Engineering log of the v2 rewrite, version by version. The narrative
+deep-dive — findings, wrong turns, method — is
+[docs/INVESTIGATION.md](docs/INVESTIGATION.md).*
 
 # dnsbench v2 — deltas vs v1
 
-Réécriture dans un répertoire séparé (`~/Dev/dnsbench-v2`), sans toucher à
-`~/Dev/dnsbench`. Source unique, toujours zéro dépendance (POSIX + horloge
-monotone, pas de Foundation). Le format de conf v1 est lu tel quel ;
-`dnsbench.conf` est une copie verbatim de la conf interne v1 pour comparer à
-panels strictement identiques.
+Rewritten in a separate tree, without touching v1. Still a single source
+file, still zero dependencies (POSIX + a monotonic clock, no Foundation).
+The v1 configuration format is read as-is; our internal `dnsbench.conf`
+is a verbatim copy of the v1 one, so that v1/v2 comparisons run on
+strictly identical panels.
 
-## v2.1 — restitution des anomalies
+## v2.1 — anomaly reporting
 
-`fail` et `err` restent les colonnes agrégées des tableaux, mais chaque Acc
-ventile désormais les timeouts, les erreurs réseau (ICMP unreachable, échecs
-send) et les RCODEs invalides par valeur (FORMERR, SERVFAIL, NOTIMP, REFUSED,
-RCODEn). Nouvelle section « anomalies » en fin de sortie console — seuls les
-résolveurs concernés apparaissent, sinon une ligne « no anomalies » explicite —
-section équivalente dans le rapport HTML, tooltips sur les cellules fail/err
-(survol = ventilation), et note contextuelle quand du REFUSED apparaît
-(signature typique du rate-limiter FTL, suggestion --gap). Classification
-pure : chemins de mesure strictement identiques à la 2.0, les runs 2.0 et 2.1
-restent comparables sur toutes les colonnes.
+`fail` and `err` remain the aggregated table columns, but each accumulator
+now breaks down timeouts, network errors (ICMP unreachable, failed sends)
+and invalid RCODEs by value (FORMERR, SERVFAIL, NOTIMP, REFUSED, RCODEn).
+New "anomalies" section at the end of the console output — only the
+resolvers concerned appear, otherwise an explicit "no anomalies" line —
+an equivalent section in the HTML report, tooltips on the fail/err cells
+(hover = breakdown), and a contextual note when REFUSED shows up (the
+typical signature of Pi-hole's FTL rate limiter, with a `--gap`
+suggestion). Pure classification: the measurement paths are strictly
+identical to 2.0, so 2.0 and 2.1 runs stay comparable on every column.
 
-## v2.2 — plancher instrument (--kts, --rt enrichi, --pin)
+## v2.2 — instrument floor (--kts, richer --rt, --pin)
 
-**--kts, timestamps noyau RX.** Le levier d'exactitude : t1 devient l'horodatage
-posé par le noyau à l'entrée de la pile réseau, via recvmsg + cmsg parsé à la
-main (les macros CMSG_* n'existent pas en Swift). Le réveil scheduler
-(5–30 µs de variance) et le résidu de biais de batch du mode parallèle sortent
-entièrement de la mesure — le shuffle Fisher-Yates devient ceinture-bretelles.
-Darwin : SCM_TIMESTAMP_MONOTONIC, même domaine mach que CLOCK_UPTIME_RAW,
-conversion timebase auto-vérifiée au premier stamp (détection ticks vs ns,
-désactivation propre si mismatch de domaine). Linux : SO_TIMESTAMPNS en
-CLOCK_REALTIME — sous kts, t0 et les deadlines basculent dans ce domaine
-(slew NTP ≤ 0,5 µs/ms de RTT ; ne pas stepper l'horloge en cours de run).
-RX uniquement : le coût d'entrée du send (~0,5–1 µs) reste dans le chiffre,
-assumé et documenté. Défaut OFF : sans --kts, le chemin de sonde est
-identique octet pour octet à la 2.1.
+**`--kts`, kernel RX timestamps.** The accuracy lever: t1 becomes the
+timestamp the kernel stamps as the packet enters the network stack, via
+`recvmsg` and a hand-parsed control message (the `CMSG_*` macros do not
+exist in Swift). The scheduler wake-up (5–30 µs of variance) and the
+residual batch bias of parallel mode leave the measurement entirely — the
+Fisher-Yates shuffle becomes belt-and-braces. Darwin:
+`SCM_TIMESTAMP_MONOTONIC`, same Mach domain as `CLOCK_UPTIME_RAW`,
+timebase conversion self-checked on the first stamp (ticks-vs-ns
+detection, clean disable on domain mismatch). Linux: `SO_TIMESTAMPNS` in
+`CLOCK_REALTIME` — under kts, t0 and the deadlines move to that domain
+(NTP slew ≤ 0.5 µs per ms of RTT; do not step the clock mid-run). RX
+only: the send-side entry cost (~0.5–1 µs) stays in the number, accepted
+and documented. Default OFF: without `--kts`, the probe path is
+byte-for-byte identical to 2.1.
 
-**--rt enrichi.** Darwin : en plus de la QoS, thread en classe time-constraint
-(période 300 µs, calcul 50 µs) — le vrai levier de latence de réveil macOS,
-celui des threads audio. Linux : SO_BUSY_POLL 50 µs par socket (le noyau
-polle la queue NIC avant de dormir, court-circuite le réveil IRQ ; dépend du
-driver et des privilèges, dégradation silencieuse sinon).
+**Richer `--rt`.** Darwin: on top of the QoS class, the thread joins the
+time-constraint class (300 µs period, 50 µs computation) — the real
+wake-up latency lever on macOS, the one audio threads use. Linux:
+`SO_BUSY_POLL` 50 µs per socket (the kernel polls the NIC queue before
+sleeping, short-circuiting the IRQ wake-up; driver- and
+privilege-dependent, silent degradation otherwise).
 
-**--pin N (Linux).** Épinglage du process sur un cœur via sched_setaffinity
-(cpu_set_t manipulé en octets bruts, les macros CPU_SET n'étant pas
-importables). Combiné à SCHED_FIFO : pas de migration, caches chauds.
-Sans effet sur Darwin (affinité consultative seulement), message explicite.
+**`--pin N` (Linux).** Pin the process to one core via
+`sched_setaffinity` (`cpu_set_t` manipulated as raw bytes, the `CPU_SET`
+macros being un-importable). Combined with `SCHED_FIFO`: no migration,
+warm caches. No effect on Darwin (affinity is advisory only), explicit
+message.
 
-Usage recommandé sur infra rapide (résolveurs à 10–50 µs) : `--kts --rt`
-(+ `--pin` côté Linux) comme plan de référence, `--spin` en second plan pour
-le plancher instrument pur. Tout à OFF par défaut : les runs 2.0/2.1/2.2 sans
-flags restent comparables.
+Recommended use on fast infrastructure (resolvers answering in 10–50 µs):
+`--kts --rt` (plus `--pin` on Linux) as the reference plane, `--spin` as
+a second plane for the pure instrument floor. Everything OFF by default:
+2.0/2.1/2.2 runs without flags remain comparable.
 
-## v2.3 — ordre de visite aléatoire (« le premier de la paire paie »)
+## v2.3 — randomized visit order ("the first of the pair pays")
 
-Découverte close le 17/08 par falsification tentée (swap-test) : en rotation
-séquentielle, un serveur refroidit ~300 ms entre deux visites ; la première
-entrée d'une paire même-serveur encaisse son réveil (125–215 µs sur les CT,
-400–590 µs sur les VMs), la seconde passe sur serveur chaud. Le « malus
-v4 » historique n'était que l'ordre de la conf (v4 listé d'abord) : conf
-inversée, le malus change de camp au signe et à la magnitude près.
+Investigation closed on 17 August by attempted falsification (the
+swap-test): in sequential rotation, a server cools for ~300 ms between
+two visits; the first entry of a same-server pair absorbs its wake-up
+(125–215 µs on containers, 400–590 µs on VMs), the second one rides a
+warm server. The historical "IPv4 penalty" was nothing but the
+configuration order (v4 listed first): with the configuration inverted,
+the penalty switches sides, sign and magnitude included.
 
-v2.3 rend les entrées échangeables : ordre de visite mélangé à chaque round
-en séquentiel, ordre d'émission mélangé par phase en parallèle (Fisher-
-Yates, même PRNG). `--fixed-order` restaure l'ordre de conf v2.2 — pour
-reproduire les anciennes campagnes, et comme sonde de froid délibérée (le
-premier d'une paire même-serveur mesure alors le réveil). Les deux grandeurs
-sont réelles : froid = première requête d'une rafale client (le stub envoie
-A/AAAA à quelques µs d'écart — le premier de chaque burst réel paie ce
-réveil) ; chaud = régime établi, mesurable en paire serrée. Le défaut v2.3
-échantillonne un mélange équitable. Note : en mode both, le MISS suit
-toujours le HIT de la même visite — le MISS a donc toujours été « chaud »
-par construction (sauf en mode miss seul).
+v2.3 makes entries exchangeable: the visit order is shuffled every round
+in sequential mode, the send order every phase in parallel mode
+(Fisher-Yates, same PRNG). `--fixed-order` restores the v2.2
+configuration order — to reproduce earlier campaigns, and as a deliberate
+cold probe (the first of a same-server pair then measures the wake-up).
+Both quantities are real: cold = the first query of a client burst (the
+stub sends A and AAAA a few µs apart — the first of every real burst pays
+this wake-up); warm = steady state, measurable in a tight pair. The v2.3
+default samples a fair mix. Note: in `both` mode, the MISS always follows
+the HIT of the same visit — so the MISS has always been "warm" by
+construction (except in miss-only mode).
 
-Relecture des campagnes v2.0–v2.2 : les colonnes RTT restent valides ;
-seules les comparaisons entre entrées partageant un serveur (paires v4/v6)
-sont à relire comme froid-vs-chaud, pas comme un effet de famille.
+Re-reading the v2.0–v2.2 campaigns: the RTT columns remain valid; only
+comparisons between entries sharing a server (v4/v6 pairs) must be
+re-read as cold-vs-warm, not as a family effect.
 
-Compléments 2.3 : `-4` / `-6` restreignent le panel à une famille sans
-éditer la conf (rejouer un test v4-only/v6-only en un flag) ; `--order
-shuffle|conf|v4-first|v6-first` pilote l'ordre — shuffle (défaut,
-mélange équitable), conf (sonde de froid par adjacence, alias
---fixed-order), v4-first/v6-first (blocs par famille dans l'ordre conf :
-chaque serveur est visité une fois par demi-tour, les deux familles
-mesurent un semi-froid symétrique et déterministe — la comparaison de
-familles à conditions thermiques égales, sans aléa). Le header et le
-rapport HTML s'auto-identifient (order/family).
+2.3 additions: `-4` / `-6` restrict the panel to one family without
+editing the configuration (replay a v4-only/v6-only test with one flag);
+`--order shuffle|conf|v4-first|v6-first` drives the order — shuffle
+(default, fair mix), conf (cold probe by adjacency, alias
+`--fixed-order`), v4-first/v6-first (family blocks in configuration
+order: each server is visited once per half-round, both families measure
+a symmetric, deterministic semi-cold state — the family comparison at
+equal thermal conditions, with no randomness). The header and the HTML
+report identify themselves (order/family).
 
-## Validité de la mesure
+## Measurement validity
 
-**Drain des réponses tardives (bug cascade v1).** En séquentiel, une réponse
-arrivée après timeout restait en file et faisait échouer toutes les rounds
-suivantes en chaîne (mismatch TXID → nil → la vraie réponse s'empile à son
-tour). `measureOnce` draine désormais jusqu'au match ou à l'échéance, budget
-restant recalculé. Le happy path reste identique à v1 (un send + un recv
-bloquant sous SO_RCVTIMEO) : le timeout n'est ré-armé que sur le chemin de
-drain, rare, puis restauré.
+**Late-reply drain (the v1 cascade bug).** In sequential mode, a reply
+arriving after the timeout stayed queued and made every subsequent round
+fail in a chain (TXID mismatch → nil → the genuine reply queues up in
+turn). `measureOnce` now drains until match or deadline, with the
+remaining budget recomputed. The happy path is identical to v1 (one send
+plus one blocking recv under `SO_RCVTIMEO`): the timeout is only re-armed
+on the rare drain path, then restored.
 
-**RCODE lu.** QR bit vérifié, RCODE parsé : NOERROR et NXDOMAIN sont des
-échantillons valides (NXDOMAIN est la réponse attendue du MISS) ; tout le reste
-(SERVFAIL, REFUSED, …) part dans une colonne `err` dédiée, latence exclue des
-percentiles. C'est ce qui rendra visible le rate-limiter FTL des Pi-hole
-(1000 req/60 s/client → REFUSED) : à 2000 rounds × 2 modes en boucle fermée,
-les runs v1 le déclenchaient très probablement sans qu'on le voie.
+**RCODE read.** QR bit checked, RCODE parsed: NOERROR and NXDOMAIN are
+valid samples (NXDOMAIN is the expected MISS answer); everything else
+(SERVFAIL, REFUSED, …) goes to a dedicated `err` column, its latency
+excluded from the percentiles. This is what makes Pi-hole's FTL rate
+limiter visible (1000 queries / 60 s / client → REFUSED): at 2000 rounds
+× 2 modes in a closed loop, the v1 runs most probably tripped it without
+anyone seeing it.
 
-**TTL au warm-up.** Le warm-up parse la section answer (compression gérée) et
-affiche le TTL min par hit domain, avec avertissement sous 120 s : un run plus
-long que le TTL ré-interroge l'amont et contamine le HIT par des MISS déguisés
-(la bimodalité observée sur www.apple.com/Akamai en est probablement en partie
-un artefact).
+**TTL at warm-up.** The warm-up parses the answer section (compression
+handled) and prints the minimum TTL per hit domain, with a warning below
+120 s: a run longer than the TTL re-queries upstream and contaminates HIT
+with disguised MISSes (the bimodality observed on www.apple.com/Akamai is
+probably partly such an artifact).
 
-**Ordre aléatoire par batch en parallèle.** Après poll(), les fd prêts sont
-traités dans un ordre Fisher-Yates par batch au lieu de l'ordre de la conf —
-supprime le biais systématique de quelques µs en faveur des premières entrées
-`[resolvers]` sur LAN.
+**Per-batch random order in parallel mode.** After `poll()`, ready
+descriptors are processed in a per-batch Fisher-Yates order instead of
+configuration order — removes the systematic bias of a few µs in favour
+of the first `[resolvers]` entries on a LAN.
 
-## Plancher de latence
+## Latency floor
 
-**Sockets UDP connectés.** send/recv au lieu de sendto/recvfrom (pas de copie
-d'adresse par appel, happy path marginalement plus court que v1), filtrage
-noyau des datagrammes étrangers, et remontée ICMP : un résolveur down coûte un
-ECONNREFUSED immédiat au lieu de rounds × timeout.
+**Connected UDP sockets.** send/recv instead of sendto/recvfrom (no
+address copy per call, a marginally shorter happy path than v1), kernel
+filtering of foreign datagrams, and ICMP surfacing: a resolver that is
+down costs an immediate ECONNREFUSED instead of rounds × timeout.
 
-**Chemin chaud zéro allocation.** Templates de requête préconstruits (un par
-hit domain + un MISS), TXID patché sur 2 octets, label MISS à largeur fixe
-12 hex (48 bits, offset 13) patché en place — send() copie dans le noyau, un
-seul buffer sert tout, y compris en parallèle où les scratch (ids, t0, pfds,
-order, results) sont préalloués une fois. PRNG xorshift64* au lieu de
-SystemRandomNumberGenerator (getrandom(2) potentiel par tirage sous Linux).
-reserveCapacity(rounds) sur les échantillons. recvBuf passé à 2048 (EDNS0).
+**Zero-allocation hot path.** Prebuilt query templates (one per hit
+domain plus one MISS), TXID patched over 2 bytes, fixed-width 12-hex MISS
+label (48 bits, offset 13) patched in place — `send()` copies into the
+kernel, so a single buffer serves everything, including parallel mode
+where the scratch arrays (ids, t0, pfds, order, results) are preallocated
+once. xorshift64* PRNG instead of `SystemRandomNumberGenerator` (a
+possible `getrandom(2)` per draw on Linux). `reserveCapacity(rounds)` on
+the samples. `recvBuf` raised to 2048 (EDNS0).
 
-**--spin (séquentiel uniquement).** recv non bloquant en busy-loop : supprime
-le réveil scheduler (5–30 µs + variance) de la mesure, au prix d'un cœur à
-100 %. Second plan de mesure (plancher instrument), pas un remplacement du mode
-par défaut. Si parallel est actif, --spin force le séquentiel avec message.
+**`--spin` (sequential only).** Non-blocking recv in a busy loop: removes
+the scheduler wake-up (5–30 µs plus variance) from the measurement, at
+the cost of one core at 100 %. A second measurement plane (instrument
+floor), not a replacement for the default mode. If parallel is active,
+`--spin` forces sequential with a message.
 
-**--rt (best-effort).** Darwin : QoS user-interactive (favorise les P-cores
-Apple Silicon). Linux : tentative SCHED_FIFO prio 10 + mlockall, dégradation
-silencieuse sans privilèges. Off par défaut pour rester comparable à v1.
+**`--rt` (best-effort).** Darwin: user-interactive QoS (favours the
+P-cores on Apple silicon). Linux: attempted `SCHED_FIFO` priority 10 plus
+`mlockall`, silent degradation without privileges. Off by default to stay
+comparable with v1.
 
-## Robustesse & portabilité
+## Robustness & portability
 
-EINTR bouclé partout (recv, poll — le `rc <= 0 → break` de fanPhase v1
-sacrifiait le batch sur un simple signal). POLLERR/POLLHUP/POLLNVAL gérés en
-parallèle (ICMP → fail immédiat). Échec socket/connect → warning + résolveur
-sauté proprement (v1 empilait un fd -1). Validation des noms DNS au démarrage
-(labels ≤ 63, total ≤ 254) — buildQuery reste trap-free. Shim
-`canImport(Musl)` aligné sur la forme validée par le build musl arm64 de la v1
-(SOCK_DGRAM importé directement en Int32, sans cast). Package.swift minimal et
-cibles `make linux-arm64` / `linux-amd64` repris de la v1 (Swift Static Linux
-SDK 6.3.3, binaires statiques musl dans dist/, zéro dépendance sur la cible) ;
-`make static-stdlib` reste disponible pour un build glibc natif. Le fork
-dnsbench-debug.swift disparaît : `-v/--verbose` réactive l'écho des adresses
-parsées, et `make debug` produit `dnsbench-debug` sans plus écraser le binaire
-release.
+EINTR retried everywhere (recv, poll — v1's `rc <= 0 → break` in
+`fanPhase` sacrificed the whole batch on a mere signal).
+POLLERR/POLLHUP/POLLNVAL handled in parallel mode (ICMP → immediate
+fail). Socket/connect failure → warning and the resolver is skipped
+cleanly (v1 pushed a -1 fd). DNS name validation at startup (labels ≤ 63,
+total ≤ 254) — `buildQuery` stays trap-free. The `canImport(Musl)` shim
+follows the form validated by v1's arm64 musl build (`SOCK_DGRAM`
+imported directly as Int32, no cast). Minimal `Package.swift` and the
+`make linux-arm64` / `linux-amd64` targets carried over from v1 (Swift
+Static Linux SDK 6.3.3, static musl binaries in `dist/`, zero dependency
+on the target); `make static-stdlib` remains available for a native glibc
+build. The forked `dnsbench-debug.swift` is gone: `-v/--verbose` brings
+back the echo of parsed addresses, and `make debug` produces
+`dnsbench-debug` without overwriting the release binary any more.
 
-## Nouvelles options
+## New options
 
-`timeout_ms` (conf, prioritaire sur timeout_sec) et `--timeout-ms` ; `gap_ms` /
-`--gap` (pacing : sleep entre requêtes en séquentiel, entre phases en
-parallèle) ; `edns` / `--edns` (OPT bufsize 1232) ; qtype étendu strict — A,
-AAAA, HTTPS, TXT ou numérique, une valeur inconnue est refusée au lieu d'être
-silencieusement mappée sur A comme en v1 ; `--version`. VERSION affichée dans
-le header, le rapport HTML et --version, donc les fichiers de résultats
-s'auto-identifient.
+`timeout_ms` (configuration, takes precedence over `timeout_sec`) and
+`--timeout-ms`; `gap_ms` / `--gap` (pacing: sleep between queries in
+sequential mode, between phases in parallel mode); `edns` / `--edns` (OPT
+bufsize 1232); strict extended qtype — A, AAAA, HTTPS, TXT or numeric; an
+unknown value is refused instead of being silently mapped to A as in v1;
+`--version`. VERSION is printed in the header, the HTML report and
+`--version`, so results files identify themselves.
 
-## À valider à la première compilation
+## To validate at first compilation (historical — since validated)
 
-Le build musl arm64 de la v1 (Swift Static Linux SDK 6.3.3) valide
-empiriquement le shim Musl et tous les patterns POSIX partagés avec la v2
-(Int16(POLLIN), nfds_t, timeval en .init(), fcntl, getaddrinfo, poll,
-mode_t). Reste à valider : le champ `sched_param.sched_priority` tel
-qu'importé par Swift côté Glibc dans `applyRuntimeHints` (utilisé seulement
-avec --rt ; sous musl, sched_setscheduler retourne ENOSYS par design — le
-fallback best-effort s'applique et le message l'indique), et les chemins
-nouveaux de la v2 (drain, fanPhase réécrit, warm-up TTL, EDNS) qui n'ont
-encore jamais été compilés nulle part. La 2.2 ajoute ses propres points à
-vérifier au premier build : import des constantes SO_TIMESTAMP_MONOTONIC /
-SCM_TIMESTAMP_MONOTONIC et des API mach thread_policy_set /
-thread_time_constraint_policy_data_t côté Darwin ; import de SO_TIMESTAMPNS /
-SCM_TIMESTAMPNS et SO_BUSY_POLL côté Linux (glibc et musl) ; types des champs
-msghdr (msg_iovlen, msg_controllen) absorbés par numericCast. En cas d'échec
-de compilation, tout est localisé dans recvWithTS, applyRuntimeHints et le
-bloc --pin.
+v1's arm64 musl build (Swift Static Linux SDK 6.3.3) empirically
+validates the Musl shim and every POSIX pattern shared with v2
+(`Int16(POLLIN)`, `nfds_t`, `timeval` via `.init()`, `fcntl`,
+`getaddrinfo`, `poll`, `mode_t`). Left to validate: the
+`sched_param.sched_priority` field as imported by Swift on the Glibc side
+in `applyRuntimeHints` (only used with `--rt`; under musl,
+`sched_setscheduler` returns ENOSYS by design — the best-effort fallback
+applies and the message says so), and v2's new paths (drain, rewritten
+`fanPhase`, TTL warm-up, EDNS) which had never been compiled anywhere
+yet. 2.2 adds its own points to check at first build: import of the
+`SO_TIMESTAMP_MONOTONIC` / `SCM_TIMESTAMP_MONOTONIC` constants and of the
+Mach `thread_policy_set` / `thread_time_constraint_policy_data_t` API on
+Darwin; import of `SO_TIMESTAMPNS` / `SCM_TIMESTAMPNS` and `SO_BUSY_POLL`
+on Linux (glibc and musl); the `msghdr` field types (`msg_iovlen`,
+`msg_controllen`) absorbed by `numericCast`. Should compilation fail,
+everything is localized in `recvWithTS`, `applyRuntimeHints` and the
+`--pin` block. (All of it has since compiled and run on macOS, Linux
+glibc and Linux musl, amd64 and arm64.)
 
-## Protocole de comparaison v1/v2
+## v1/v2 comparison protocol
 
-Même hôte, même conf (copie verbatim incluse), runs back-to-back, séquentiel,
-`--sort p50`. Les colonnes RTT (min/p50/p90/p99/…) sont comparables ; `n`,
-`fail` et `err` ne le sont pas, par construction : v2 récupère des échantillons
-que v1 perdait (drain) et déclasse en `err` des réponses que v1 comptait comme
-succès (RCODE). Un `err` non nul sur phebe1/phebe4 en v2 signifiera que les
-runs v1 mesuraient en partie le rate-limiter FTL. Pour une comparaison propre
-du cache lui-même, `--gap 5` maintient ~2000 req/60 s réparties sur le panel,
-sous le seuil FTL par phase. Le happy path v2 (send/recv connecté) est
-structurellement plus court que v1 (sendto/recvfrom) de l'ordre de la fraction
-de µs — attendu, c'est un des objectifs. Même protocole applicable sur cible
-Linux avec les binaires dist/ (v1 arm64 déjà produit, v2 via make linux-arm64).
+Same host, same configuration (verbatim copy included), back-to-back
+runs, sequential, `--sort p50`. The RTT columns (min/p50/p90/p99/…) are
+comparable; `n`, `fail` and `err` are not, by construction: v2 recovers
+samples v1 lost (drain) and demotes to `err` replies v1 counted as
+successes (RCODE). A non-zero `err` on the Pi-hole targets in v2 will
+mean the v1 runs were partly measuring the FTL rate limiter. For a clean
+comparison of the cache itself, `--gap 5` keeps ~2000 queries / 60 s
+spread over the panel, below the FTL threshold per phase. The v2 happy
+path (connected send/recv) is structurally shorter than v1's
+(sendto/recvfrom) by a fraction of a µs — expected, it is one of the
+goals. The same protocol applies on Linux targets with the `dist/`
+binaries (v1 arm64 already produced, v2 via `make linux-arm64`).
 
-## Différé (v2.x)
+## Deferred (v2.x)
 
-Sortie --json/--csv puis textfile-collector Prometheus (stack #31) ;
-`--bind`. DoT/DoH : non-but (zéro dépendance). Écartés délibérément :
-io_uring SQPOLL (changement d'architecture Linux-only pour 1–2 µs déjà sous
-le plancher --kts), timestamps TX (MSG_ERRQUEUE, complexité disproportionnée
-pour ~1 µs côté émission), PR_SET_TIMERSLACK (prctl est variadique en C,
-inappelable depuis Swift).
+`--json`/`--csv` output, then a Prometheus textfile collector; `--bind`.
+DoT/DoH: non-goal (zero dependencies). Deliberately set aside: io_uring
+SQPOLL (a Linux-only architecture change for 1–2 µs already below the
+`--kts` floor), TX timestamps (`MSG_ERRQUEUE`, disproportionate
+complexity for ~1 µs on the send side), `PR_SET_TIMERSLACK` (`prctl` is
+variadic in C, uncallable from Swift).

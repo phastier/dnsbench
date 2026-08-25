@@ -1,8 +1,8 @@
-# Binaires compilés
+# Compiled binaries
 /dnsbench
 /dnsbench-debug
 
-# Artefacts de build Swift
+# Swift build artifacts
 .build/
 *.o
 *.swiftmodule
@@ -10,16 +10,16 @@
 # macOS
 .DS_Store
 
-# Config interne (perso) — partir de dnsbench.conf.example
+# Personal configuration — start from dnsbench.conf.example
 dnsbench.conf
 
-# Rendus HTML (régénérables via --html)
+# HTML reports (regenerate with --html)
 *.html
 
-# Campagnes de tests internes (scripts, diags, résultats) et journal de session
+# Internal test campaigns (scripts, diagnostics, results) and session journal
 /tests/
 /JOURNAL.md
 
-# Artefacts de build SwiftPM et binaires de distribution (releases GitHub)
+# SwiftPM build artifacts and distribution binaries (GitHub releases)
 /.build/
 /dist/
