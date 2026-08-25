@@ -168,33 +168,255 @@ the first query the resolver caches the delegation, so subsequent misses
 mostly measure the final hop to your authority — representative of
 production.
 
-## Cold, warm, and visit order
+## Options, and why each one exists
 
-A resolver idle for ~300 ms re-enters deep C-states (or gets its vCPU
-descheduled). Both states are real: *cold* is what the first query of every
-client burst pays (stubs send A and AAAA back-to-back); *warm* is steady
-state. dnsbench lets you choose what you measure:
+Nothing here was designed up front. Every flag below was added because a
+measurement campaign needed it — and the number that justified it is
+given each time. Command-line flags override the corresponding
+configuration keys; everything is off by default so that a bare run stays
+comparable with earlier ones.
 
-- `--order shuffle` (default): per-round random visit order — entries
-  sharing a server become exchangeable, fair mix of cold and warm.
-- `--order conf`: file order — the first entry of a same-server pair
-  absorbs the wake-up. A deliberate cold probe (alias: `--fixed-order`).
-- `--order v4-first` / `v6-first`: family blocks — each family cooled
-  ~half a round, symmetric and deterministic.
-- Tight two-entry conf = warm probe; add `--gap 300` to turn it into a
-  symmetric cold probe (the server sleeps before every query).
-- `-4` / `-6`: restrict the panel to one family without editing the conf.
+### Run shape
 
-## Accuracy planes
+**`-c FILE`** (or a bare argument) — configuration file, default
+`./dnsbench.conf`. One panel per file: we keep one for the fleet, one for
+public resolvers, tight two-entry ones for cold probes.
 
-- `--kts`: kernel RX timestamps (SO_TIMESTAMP_MONOTONIC / SO_TIMESTAMPNS) —
-  t1 is stamped at packet arrival; scheduler wake-up and batch bias leave
-  the measurement.
-- `--spin`: busy-wait receive — the instrument floor (also keeps the send
-  path hot; costs one core).
-- `--rt`, `--pin N`: scheduling hints (Darwin time-constraint / Linux
-  SCHED_FIFO + SO_BUSY_POLL) and CPU affinity — variance killers.
-- `--edns`: probe with an OPT record, like modern stubs actually do.
+**`--rounds N`** — measurements per resolver *and per mode*. 20 for a
+smoke test, 2000 for a decision, 10 000 for a citable p99. Why the
+distinction matters: at n=2000 the p99 rests on ~20 samples; at
+n=10 000, two consecutive runs on the same resolver still put p99.9 at
+10.8 ms and then 28 ms — a single ARP refresh moved it. p99.9 is
+decoration at any n we can afford.
+
+**`--mode hit|miss|both`** — which phase(s) to run. Public resolvers
+rate-limit and DoS-protect random-label floods (DNS4EU caps around
+1000 qps per IP, Cloudflare and Google throttle NXDOMAIN bursts): their
+MISS is slow, noisy and meaningless, so probe them `hit`-only. `miss`
+alone measures the recursion path. Note that in `both`, the MISS query
+follows the HIT of the same visit, so MISS is always a *warm* measurement
+by construction.
+
+**`--qtype A|AAAA|HTTPS|TXT|N`** — global query type, overridable per hit
+domain in the conf. v1 silently mapped any unknown type to A; v2 refuses
+it. HTTPS (type 65) is there because that is what modern stubs — Apple's
+in particular — actually ask for alongside A and AAAA.
+
+**`--timeout-ms N`** (conf: `timeout_ms`, takes precedence over
+`timeout_sec`) — receive timeout. The v1 cascade bug lived exactly at this
+boundary: a WAN reply landing just after the 1 s timeout poisoned every
+subsequent round (791, 2 590, then 28 430 false failures in one night;
+one resolver "lost" 75 % of its rounds). v2 drains late replies, so the
+timeout is now a clean classification threshold you can set to the
+millisecond — 250 ms is plenty on a LAN.
+
+**`--gap MS`** (conf: `gap_ms`) — pacing: sleep between queries in
+sequential mode, between phases in parallel mode. Two reasons, found in
+that order. First, rate limits: Pi-hole's FTL answers REFUSED beyond
+1000 queries per 60 s per client, and a closed loop at 2000 rounds × 2
+modes trips it — v1 could not see it (the REFUSED were counted as
+samples), v2 shows it in the `err` column, `--gap 5` avoids it. Second,
+and more interesting: `--gap 300` on a tight two-entry conf turns the run
+into a **symmetric cold probe** — the server is left idle long enough to
+enter deep C-states (or lose its vCPU) before *every* query. That probe is
+how we measured the wake-up cost of our resolvers (~330–400 µs on
+containers, 450–600 µs on VMs), then tested every hardware lever against
+it: deep C-states were worth 20–26 µs, CPU frequency ramp-up 6–28 µs, NIC
+interrupt coalescing nothing at all, and one runtime setting
+(`DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1`) a confirmed 32–45 µs.
+
+**`--parallel` / `--no-parallel`** (conf: `parallel`) — fan one query per
+resolver out at once and collect with `poll()`. One request stays in
+flight *per resolver*, so each resolver's latency is untouched; the
+round's wall-clock collapses from the sum of RTTs to roughly the slowest
+one. On our panel, 2000 rounds took 9 min 30 s sequential and 74 s
+parallel. Two caveats we paid for: a parallel run is
+not directly comparable to a sequential one (the client core stays hot,
+LAN RTTs come out slightly lower), and the order in which ready
+descriptors are processed after `poll()` biased early config entries by
+a few µs on fast LANs — v2 randomizes it per batch.
+
+### Panel
+
+**`-4` / `-6`** — restrict the panel to one address family without
+editing the conf (mutually exclusive). During the IPv4 investigation we
+were re-running family-only tests by hand-editing configurations; this
+is that edit as a flag.
+
+**`--order shuffle|conf|v4-first|v6-first`**, **`--fixed-order`** (alias
+of `conf`) — visit order in sequential mode, send order in parallel mode.
+This one is the reason v2.3 exists. For days our data said IPv4 was
+slower than IPv6 on the same LAN targets: +67 to +191 µs on container
+resolvers, +410 to +499 µs on VMs, from every client, under every option.
+We burned four hypotheses on it. The tell: in isolated two-entry tests
+the penalty was exactly zero, and in full rotation it always landed on
+whichever family was listed *first*. A resolver idle for ~300 ms between
+visits cools down — C-state entry for containers, vCPU descheduling for
+VMs — and the first query of an adjacent same-server pair pays the
+wake-up while the second rides a warm server. An inverted conf (v6 first)
+flipped the sign on all four pairs: +401/+159/+120/+479 µs became
+−468/−168/−131/−594. Not a protocol effect; a visit-order effect.
+
+Both thermal states are real — *cold* is what the first query of every
+client burst pays (stubs send A and AAAA back-to-back), *warm* is steady
+state — so the instrument now lets you say which one you sample:
+
+- `shuffle` (default): per-round random order — entries sharing a server
+  become exchangeable, a fair mix of cold and warm.
+- `conf`: file order — the first entry of a same-server pair absorbs the
+  wake-up. A deliberate cold probe, and the way to reproduce v2.2-era
+  campaigns.
+- `v4-first` / `v6-first`: family blocks — each family cooled ~half a
+  round, symmetric and deterministic. The right tool for comparing
+  families at equal thermal conditions.
+- A tight two-entry conf is a warm probe; add `--gap 300` for a
+  symmetric cold one.
+
+### Accuracy planes
+
+The default measurement takes `t1` in user space, after the scheduler has
+woken the probe up. That wake-up is 5–30 µs on an idle machine and
+hundreds of µs under load — the same size as the effects we were chasing.
+Three flags move the measurement to a better plane. All were ranked
+against each other in an interleaved option matrix on the macOS client
+against a container resolver answering in ~0.4 ms.
+
+**`--kts`** — kernel RX timestamps: `t1` is stamped by the kernel when the
+packet enters the network stack (`SO_TIMESTAMP_MONOTONIC` on Darwin,
+`SO_TIMESTAMPNS` on Linux, control message parsed by hand), so the
+scheduler wake-up and the batch bias of parallel mode leave the
+measurement entirely. Measured: −30 µs at p50, −70 µs at p90, tighter
+std. It is our reference plane for accuracy. Honest limits: RX only — the
+send-side entry cost stays in the number (see `--spin` for how much that
+is); on Linux the probe clock switches to `CLOCK_REALTIME` to share the
+kernel's domain (NTP slew ≤ 0.5 µs per ms of RTT — do not *step* the clock
+mid-run); on macOS the stamp lives in the same Mach domain as the default
+clock and the timebase conversion is self-checked on the first packet.
+
+**`--spin`** — busy-wait on a non-blocking `recv()` instead of sleeping:
+no wake-up at all, at the cost of one core at 100 %. Sequential only (it
+forces it). Measured on the same target: p50 0.492 → 0.366 ms (−126 µs),
+p90 −157 µs, min −30 to −47 µs. The instructive part: `--spin` beat
+`--kts` at p50 although `--kts` stamps in the kernel. The explanation is
+that spinning also keeps the *send* side hot — an active P-core, no
+frequency ramp, warm caches and policy state at `send()` — and `--kts`
+by definition removes none of that. That is how we learned that sending
+from a sleeping core costs ~30–50 µs, and why the two flags are
+complementary rather than redundant.
+
+**`--rt`** — best-effort latency hints. Darwin: QoS user-interactive plus
+a Mach time-constraint thread policy (300 µs period, 50 µs computation —
+the class audio threads use). Linux: `SCHED_FIFO` priority 10, `mlockall`,
+and `SO_BUSY_POLL` 50 µs on every socket (needs root or `CAP_SYS_NICE`;
+degrades silently otherwise). Measured: the median did not move (it even
+gained 30 µs once) but the standard deviation dropped by ~1.5× (0.257 →
+0.164 ms). `--rt` is a variance killer, not a floor — what you want for
+campaigns that must be reproducible week after week.
+
+**`--pin N`** — Linux only: pin the process to one CPU (`sched_setaffinity`).
+`SCHED_FIFO` alone still lets the probe migrate between cores; pinned, it
+keeps its caches. Our reference series on the hypervisor nodes runs
+`--pin 2`. Ignored on macOS with a message (affinity is advisory there).
+
+One caveat that saved us time: on VM-hosted resolvers answering in
+1.2–1.7 ms, none of these planes made any visible difference — the
+hypervisor path dominates everything. Accuracy planes matter when the
+resolver answers in 100–400 µs; below that, spend the effort on the
+resolver instead.
+
+### Protocol realism
+
+**`--edns`** (conf: `edns`) — add an EDNS0 OPT record (UDP buffer 1232),
+like every modern stub does. Measured cost versus bare queries: +80 to
++140 µs on LAN targets, +250 to +500 µs on WAN. The latency a real client
+experiences is closer to the `--edns` number than to the bare one; keep
+that in mind when quoting figures. Off by default so runs stay comparable
+with earlier campaigns.
+
+### Output
+
+**`--sort KEY`** — `min|p50|p90|p99|p999|max|mean`: orders each table
+fastest-first and drives the `vs` column (ratio to the fastest resolver on
+that metric). Default p50 — read percentiles, not means.
+
+**`--html FILE`** — a self-contained report (inline CSS/SVG, no network):
+per-resolver percentile tables, one CDF chart per phase overlaying every
+resolver (X log-scaled, v4 solid, v6 dashed), and the anomalies
+breakdown. We needed the CDF the day a resolver's latency turned out
+bimodal: a mean hides it, a percentile table half-hides it, a step in the
+curve shows it.
+
+**`-v` / `--verbose`** — echo the parsed resolver addresses at startup.
+This replaces v1's forked "debug" source file, which `make debug` used to
+compile over the release binary.
+
+**`--version`** — and the run header says the rest: version, panel size,
+rounds, mode, active planes (`(spin)`, `(kts)`), visit order or family
+filter, timeout, gap, clock cost and resolution. After a 33-run campaign
+in which we had to reconstruct which run carried which flags, every
+results file now identifies itself.
+
+### Configuration keys
+
+| Key | Role | CLI equivalent |
+|---|---|---|
+| `rounds` | measurements per resolver and per mode | `--rounds` |
+| `timeout_sec` / `timeout_ms` | receive timeout (`timeout_ms` wins if both) | `--timeout-ms` |
+| `gap_ms` | pacing between queries / phases | `--gap` |
+| `edns` | `yes` to add an OPT record | `--edns` |
+| `qtype` | global query type | `--qtype` |
+| `mode` | `hit`, `miss` or `both` | `--mode` |
+| `parallel` | `yes` for poll-based fan-out | `--parallel` / `--no-parallel` |
+| `[hit_domains]` | one `name [qtype]` per line, rotated round-robin; prefer long TTLs | — |
+| `miss_base` | zone under which the random MISS label is prefixed | — |
+| `[resolvers]` | one `address name` per line, v4 and v6 mixed freely | `-4` / `-6` filter |
+
+### Recipes
+
+    ./dnsbench --rounds 20                              # smoke test
+    ./dnsbench --sort p50 --html report.html            # choose resolvers for a fleet
+    ./dnsbench --rounds 10000 --sort p99                # citable p99
+    ./dnsbench --mode hit --parallel --gap 5            # public resolvers, rate-limit friendly
+    ./dnsbench --kts --spin                             # macOS: accuracy + instrument floor
+    ./dnsbench --rounds 5000 --kts --rt --spin --pin 2  # Linux node: our reference series
+    ./dnsbench -c pair.conf --gap 300 --rounds 500      # symmetric cold probe (two-entry conf)
+    ./dnsbench --order v4-first ; ./dnsbench --order v6-first   # families at equal thermal state
+    ./dnsbench --fixed-order                            # reproduce a v2.2-era campaign
+
+When comparing two settings, run them ABAB — never AAAA then BBBB — and
+call the difference real only when |Δp50| exceeds the spread between
+repetitions on both sides. That rule killed a plausible storage
+"optimization" that was pure tail variance; it will kill yours too.
+
+### What a run looks like
+
+Excerpt of a 5000-round reference run from one of our hypervisor nodes
+(`--kts --rt --spin --pin 2`; the MISS base is redacted):
+
+    dnsbench v2.3 - 12 resolvers, 5000 rounds/mode, mode=both (spin) (kts), timeout 1000 ms, 3 hit domain(s), default qtype=A, vs/sort=p50
+    clock: ~17 ns/call, resolution 10 ns
+    MISS=<rand>.example.com
+
+    === cache-HIT (ms) ===
+    resolver        n      fail  err   min       p50       p90       p99       p99.9     max       mean      std       vs
+    phebe2          5000   0     0     0.052     0.190     0.240     0.333     2.597     195.440   0.276     3.735     1.00x
+    phebe2-v6       5000   0     0     0.054     0.191     0.240     0.337     1.249     6.186     0.189     0.112     1.00x
+    phebe3          5000   0     0     0.155     0.408     0.452     0.492     0.555     519.494   0.503     7.343     2.14x
+    phebe3-v6       5000   0     0     0.180     0.424     0.458     0.499     0.750     485.361   0.590     8.957     2.23x
+    phebe1          5000   0     0     0.322     1.434     2.043     2.703     4.802     8.881     1.413     0.538     7.52x
+    cloudflare-v6   5000   0     0     8.347     9.523     10.186    12.043    16.051    22.205    9.590     0.699     49.93x
+    google          5000   0     0     7.556     9.229     18.613    28.101    32.787    63.020    11.965    4.888     48.39x
+
+    === anomalies (excluded from samples) ===
+    phebe4          HIT: 1 timeout  |  MISS: 1 timeout
+    google-v6       MISS: 2 timeout
+
+Read it the way we do: phebe2 and phebe3 are two identical containers on
+two different nodes — same software, 0.19 vs 0.41 ms, and that gap was the
+start of a whole investigation. The `max` column on phebe2 (195 ms) is one
+event in 5000; `std` reports it, `p99` does not care. The anomalies
+section is the whole error story: 0 REFUSED, 0 SERVFAIL, four timeouts in
+120 000 queries.
 
 ## Clock
 
