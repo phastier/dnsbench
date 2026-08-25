@@ -418,6 +418,19 @@ event in 5000; `std` reports it, `p99` does not care. The anomalies
 section is the whole error story: 0 REFUSED, 0 SERVFAIL, four timeouts in
 120 000 queries.
 
+The same panel as an HTML report (`--html`), this time from the macOS
+client on the default plane — 14 resolvers, 2000 rounds, an evening in
+August. Full report: [docs/report-full.png](docs/report-full.png).
+
+![dnsbench HTML report: cache-HIT table and CDF](docs/report-hit.png)
+
+Two things to read off the curves. phebe2's HIT has a knee around 0.6 ms:
+a bimodal distribution, which its mean (0.73) and even its p50 (0.55)
+would never show you. And google's staircase between 9 and 25 ms is the
+usual signature of several anycast instances answering in turn — a
+reminder that a public resolver's "latency" is a distribution over paths,
+not a number.
+
 ## Clock
 
 `CLOCK_MONOTONIC_RAW` (Linux) / `CLOCK_UPTIME_RAW` (Darwin): monotonic,
