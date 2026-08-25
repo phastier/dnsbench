@@ -1,156 +1,96 @@
 # dnsbench
 
-A **sub-millisecond** DNS latency probe, cross-platform (macOS + Linux), written
-in Swift with zero dependencies. It measures the **application-level RTT** of a
-DNS query - exactly what a client experiences - separating **cache-HIT** from
-**cache-MISS**, reports **exact percentiles** plus a ratio to the fastest, and
-emits a standalone **HTML report** with overlaid distribution curves.
+A sub-millisecond DNS latency probe and diagnostic instrument, for choosing
+your resolvers — internal or external — and their resolution order, on
+measurements as rigorous as we can make them.
 
-It exists because existing tools don't go low enough. `dig` reports `Query time`
-in whole milliseconds (useless on a 10G LAN where a warm lookup is sub-millisecond),
-and a Python script pays an interpreter overhead that dominates the signal. A
-native binary brings the measurement floor down to the syscall cost (~a few µs).
+This is **not** a public-resolver ranking. Anycast results depend on your
+ISP, your peering, your address family and your source address; we measured
+deltas of ±0.3 ms on the *same* public resolver from two machines on the
+same LAN. dnsbench exists to answer a different question: *on this network,
+from this machine, which resolvers should this fleet use, in which order —
+and when a number looks wrong, why?*
 
-## What it measures (and what it doesn't)
+## Philosophy
 
-- **Application-level RTT** = time between `sendto()` and `recvfrom()`. It includes
-  the local stack overhead (syscall, NIC, driver): deliberate, it is what a real
-  client incurs, and being common to every resolver it cancels out in **relative
-  comparison**.
-- **cache-HIT**: pre-warmed domains, resolved hot. Cache service latency.
-- **cache-MISS**: a fresh random subdomain per request, forcing a real recursion.
-  The only mode where a recursive resolver and a forwarder actually differ.
-- Not a throughput/load tool: closed-loop (one request in flight), so it measures
-  **nominal** latency, not behaviour under saturation.
+- **Closed loop.** Never more than one query in flight per resolver. The
+  probe's throughput is the sum of the RTTs, by design: dnsbench is a
+  latency instrument, not a load generator (use dnsperf for that).
+- **Zero dependencies.** One Swift file, POSIX syscalls, raw monotonic
+  clock (~30 ns/read), no Foundation, no external libraries. Static musl
+  builds for Linux amd64/arm64; native build on macOS.
+- **The OS stack is part of the measurement — deliberately.** A DNS lookup
+  crosses your kernel, your scheduler, your NIC driver and (on managed
+  Macs) your network-extension stack before it crosses the wire. dnsbench
+  measures the whole path, and gives you the tools to isolate each layer:
+  kernel RX timestamps, busy-wait floors, RT scheduling hints, CPU pinning,
+  visit-order control. Two findings from building it: on macOS with a
+  network-extension stack present, every *unconnected* UDP datagram pays a
+  per-packet policy-evaluation cost (~0.15 ms on our fleet) that connect()
+  amortizes to once per flow; and in any rotating benchmark, *the first
+  query of a pair pays the server's wake-up* (125–600 µs depending on
+  C-states and virtualization) while the second rides a warm server — a
+  bias that silently masquerades as a protocol difference. Details, data
+  and falsification tests: docs/INVESTIGATION.md.
 
-## Build
+## What it measures
 
-```sh
-make            # optimized binary ./dnsbench
-make run        # build + run with ./dnsbench.conf
-make debug      # -Onone -g
-```
+For each resolver: cache-HIT latency (rotating pre-warmed domains) and
+cache-MISS latency (unique random labels under a base you control — use a
+domain you own). Exact percentiles (min/p50/p90/p99/p99.9/max), mean, std,
+per-resolver error accounting (timeouts, network errors, per-RCODE counts —
+a SERVFAIL is not a latency sample), and a self-contained HTML report with
+CDF charts. Late replies are drained, never misattributed.
 
-Single file, no Foundation: only POSIX sockets and the monotonic clock. The two
-cross-platform spots are isolated at the top (`Darwin`/`Glibc` shim, clock).
+## Cold, warm, and visit order
 
-## Usage
+A resolver idle for ~300 ms re-enters deep C-states (or gets its vCPU
+descheduled). Both states are real: *cold* is what the first query of every
+client burst pays (stubs send A and AAAA back-to-back); *warm* is steady
+state. dnsbench lets you choose what you measure:
 
-First run? Create your config from the template, then edit the `[resolvers]`
-section for your own setup:
+- `--order shuffle` (default): per-round random visit order — entries
+  sharing a server become exchangeable, fair mix of cold and warm.
+- `--order conf`: file order — the first entry of a same-server pair
+  absorbs the wake-up. A deliberate cold probe (alias: `--fixed-order`).
+- `--order v4-first` / `v6-first`: family blocks — each family cooled
+  ~half a round, symmetric and deterministic.
+- Tight two-entry conf = warm probe; add `--gap 300` to turn it into a
+  symmetric cold probe (the server sleeps before every query).
+- `-4` / `-6`: restrict the panel to one family without editing the conf.
 
-```sh
-cp dnsbench.conf.example dnsbench.conf
-```
+## Accuracy planes
 
-```sh
-./dnsbench                              # uses ./dnsbench.conf
-./dnsbench -c examples/public-dns.conf  # explicit config file
-./dnsbench --rounds 20                  # quick smoke test
-./dnsbench --qtype AAAA                 # override the global query type
-./dnsbench --mode hit                   # run only HIT (or: miss | both)
-./dnsbench --parallel                   # fan out one query per resolver at once
-./dnsbench --sort p50                   # sort + ratio on a metric
-./dnsbench --html run.html              # also write an HTML report
-```
+- `--kts`: kernel RX timestamps (SO_TIMESTAMP_MONOTONIC / SO_TIMESTAMPNS) —
+  t1 is stamped at packet arrival; scheduler wake-up and batch bias leave
+  the measurement.
+- `--spin`: busy-wait receive — the instrument floor (also keeps the send
+  path hot; costs one core).
+- `--rt`, `--pin N`: scheduling hints (Darwin time-constraint / Linux
+  SCHED_FIFO + SO_BUSY_POLL) and CPU affinity — variance killers.
+- `--edns`: probe with an OPT record, like modern stubs actually do.
 
-- `--sort KEY` (`min|p50|p90|p99|p999|max|mean`) orders each table fastest-first
-  and drives the **`vs` column** (ratio to the fastest resolver on that metric;
-  the fastest shows `1.00x`). Default metric is `p50`.
-- `--mode hit|miss|both` selects the phase(s). Use `hit` for public resolvers,
-  whose MISS is rate-limited and not meaningful.
-- `--parallel` (config key `parallel = yes`, override with `--no-parallel`) fans
-  out one query per resolver at once and collects replies with `poll()`, instead
-  of the default sequential closed-loop. One request stays in flight **per
-  resolver**, so each resolver's latency is unaffected; the per-round wall-clock
-  drops from `sum(latencies)` to `~max(latency)`. Use it for large/slow panels
-  (the public one enables it). Caveat: a parallel run isn't directly comparable
-  to a sequential one (different client-side conditions) - comparison *between*
-  resolvers within a single run stays valid.
-- Progress is on **stderr**, time-throttled (~200 ms) with a live request count,
-  fail count and **req/s** - so you see movement even when slow resolvers stall:
+## Statistics, honestly
 
-```sh
-./dnsbench --sort p99 > run-2026-06-17.txt
-```
+At n=2000, p50 and p90 are solid; p99 rests on ~20 tail samples
+(indicative); p99.9 on 2 (decorative). Use 10000 rounds for a citable p99.
+Run-to-run variance exceeds within-run variance: repeat, and **interleave**
+repetitions (ABAB), never group them. An effect is real when |Δp50| exceeds
+the inter-repetition spread on both sides.
 
-The `--html` report is self-contained (inline CSS/SVG, no network): per-resolver
-percentile tables, a p50 bar per row, and a **CDF chart per phase** overlaying
-every resolver's latency distribution - X log-scaled, **v4 solid / v6 dashed**.
-A curve further left is faster; percentiles read off directly.
+## Quick start
 
-## Comparing public resolvers
+    make                       # native build
+    make linux-amd64           # static musl cross-build (also: linux-arm64)
+    cp dnsbench.conf.example dnsbench.conf   # edit: your resolvers, your miss_base
+    ./dnsbench --sort p50 --html report.html
 
-`examples/public-dns.conf` ships a ready panel (HIT-only): Cloudflare (standard /
-malware / malware+adult), Google (primary + secondary), and DNS4EU (the five EU
-sovereign variants from joindns4.eu - `86.54.11.{1,11,12,13,100}` with matching
-`2a13:1001::86:54:11:X` IPv6), each in IPv4 and IPv6.
+## Critique welcome
 
-```sh
-./dnsbench -c examples/public-dns.conf --sort p50 --html public.html
-```
+This tool was built by measuring, being wrong in public, and testing the
+next hypothesis to destruction. If you see a flaw in the method, open an
+issue. And if you run 25/40/100 GbE gear: we would love your numbers — at
+those speeds the resolver answers in tens of microseconds and the
+instrument's floor becomes the story.
 
-Public resolvers rate-limit (DNS4EU ~1000 qps/IP; Cloudflare/Google throttle
-NXDOMAIN floods), which is why the panel runs HIT-only. Google has no public
-filtered variant, unlike Cloudflare and DNS4EU.
-
-## Configuration
-
-| Key | Role |
-|-----|------|
-| `rounds` | Measurements per resolver and per mode |
-| `timeout_sec` | Receive timeout (beyond this: FAIL) |
-| `qtype` | Global default query type, `A` or `AAAA` |
-| `mode` | `hit`, `miss` or `both` (CLI `--mode` overrides) |
-| `parallel` | `yes` to fan out queries via `poll()` (CLI `--parallel` / `--no-parallel`) |
-| `miss_base` | Base to prefix a random label onto (cache-MISS) |
-
-Sections, one entry per line: `[hit_domains]` (`<domain> [A|AAAA]`, rotated and
-aggregated per resolver) and `[resolvers]` (`<address> <name>`, v4 or v6).
-
-### Why `miss_base` matters
-
-The MISS prefixes a unique random label to `miss_base` so the name is never cached
-and the resolver must recurse every time. Point it at a zone **you** control: you
-own the authority, the NXDOMAIN is fast and constant, and you measure your
-resolver's recursion path rather than a third party's variability. After the first
-query the resolver caches the delegation, so subsequent misses mostly measure the
-final hop to your authority - representative of production.
-
-## Clock
-
-`CLOCK_MONOTONIC_RAW` (Linux) / `CLOCK_UPTIME_RAW` (Darwin): monotonic, **not
-NTP/adjtime-disciplined**. On startup it prints the **amortized cost** of one
-timestamp call and the **effective resolution** (smallest strictly-positive delta),
-both in ns - tens of ns against millisecond RTTs, so the instrument is orders of
-magnitude finer than the phenomenon.
-
-## Reading the results
-
-Two tables (HIT/MISS) in ms (µs precision): `n`, `fail`, `min / p50 / p90 / p99 /
-p99.9 / max / mean / std`, and `vs` (ratio to the fastest). Read the percentiles,
-not the mean. A resolver with `n=0, fail=<rounds>` was unreachable over that
-transport - a useful connectivity check in its own right.
-
-## Methodology
-
-- **Interleaving**: resolvers swept round-robin each round, spreading system noise.
-- **Parallel mode**: optional fan-out/fan-in over `poll()`; one query in flight per
-  resolver (no on-resolver contention), wall-clock per round ~ the slowest reply.
-- **Pairing**: replies checked against their transaction ID; mismatches discarded.
-- **Deterministic MISS**: prefer a `miss_base` whose authority you control.
-
-### Reading the distribution curves (threshold effects)
-
-Steps in a CDF mean a **multimodal** latency: a flat plateau is a latency band
-with almost no samples (a gap between modes), a steep rise is a mode. Common
-causes on public resolvers: anycast/multi-POP variance (a fast nearby instance vs
-an occasional slow path), cache tiers (edge hit vs core recursion), and aggressive
-negative caching (RFC 8198 NSEC) on signed zones, where a fraction of random-label
-MISS are answered from cached NSEC without reaching the authority. A tight,
-unimodal curve (typical of a local recursive resolver hitting one authority)
-indicates a single deterministic path.
-
-## License
-
-MIT - see [LICENSE](LICENSE).
+See CHANGES.md for the full engineering log, LICENSE for terms.

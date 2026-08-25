@@ -1,55 +1,51 @@
-# ============================================================
-#  dnsbench.conf - parameters for the DNS latency probe
-#  Copy this file to dnsbench.conf and edit it for your setup:
-#      cp dnsbench.conf.example dnsbench.conf
-#  Everything variable lives here; the Swift source hard-codes nothing.
-#  Blank lines and anything after "#" are ignored.
-#
-#  This file = your internal resolution stack (+ a light external reference).
-#  To compare PUBLIC resolvers instead (Cloudflare variants, Google, DNS4EU):
-#      ./dnsbench -c examples/public-dns.conf --sort p50
-# ============================================================
+# dnsbench v2 configuration
+# Lines starting with # are comments. Sections in [brackets].
 
-# Number of measurements per resolver AND per mode (HIT + MISS).
-rounds = 2000
+# Number of measurement rounds per mode (HIT and MISS each get this many).
+rounds = 200
 
-# Receive timeout in seconds (beyond this: counted as FAIL).
+# Receive timeout. timeout_ms takes precedence over timeout_sec when both are set.
 timeout_sec = 1
+#timeout_ms = 250
 
-# Global default query type, applied to the cache-MISS and to any hit domain
-# below that has no explicit type. A (IPv4) or AAAA (IPv6). Overridable with
-# --qtype on the command line.
+# Pacing: fixed sleep between queries (sequential) or phases (parallel), in ms.
+# Useful to stay under resolver-side rate limits: Pi-hole FTL defaults to
+# 1000 queries / 60 s / client and answers REFUSED beyond (visible in `err`).
+#gap_ms = 5
+
+# Add an EDNS0 OPT record (UDP bufsize 1232), like modern stub resolvers.
+#edns = no
+
+# Global query type: A, AAAA, HTTPS, TXT, or a bare numeric type (e.g. 65).
 qtype = A
 
-# Base for the cache-MISS: a unique random label is prefixed to every request to
-# force a real recursion. Point it at a zone whose authority YOU control (fast,
-# deterministic NXDOMAIN) - replace example.com with your own infrastructure domain.
-miss_base = example.com
+# hit | miss | both
+mode = both
 
-# ============================================================
-#  Cache-HIT domains: "<domain> [A|AAAA]" (one per line).
-#  Type optional, defaults to the global qtype. The HIT loop rotates across this
-#  list (each domain pre-warmed), aggregated per resolver.
-# ============================================================
+# Sequential (closed-loop, default) or parallel (one in-flight query per
+# resolver, poll-based fan-out).
+parallel = no
+
+# Cache-HIT domains, one per line: name [qtype]
+# Rotated round-robin across rounds. The optional per-domain qtype overrides
+# the global one. Prefer names with LONG TTLs: the warm-up prints the answer's
+# min TTL and warns below 120 s, because a run longer than the TTL re-fetches
+# upstream and contaminates HIT with MISS.
 [hit_domains]
 www.apple.com
-www.icloud.com
-www.cloudflare.com
+www.wikipedia.org
+#example.com HTTPS
 
-# ============================================================
-#  Resolvers to test: "<address>  <name>" (one per line).
-#  List your own internal resolvers below (v4 + matching v6), then keep a light
-#  external reference. Full public panel lives in examples/public-dns.conf.
-# ============================================================
+# Base domain for cache-MISS: queries go to <12-hex-random>.<miss_base>.
+# Use a zone you control (or example.com); NXDOMAIN is the expected answer
+# and counts as a valid latency sample.
+miss_base = example.com
+
+# Resolvers to probe: address name, one per line. v4 and v6 mix freely.
 [resolvers]
-# --- Your internal resolvers (uncomment and set your own addresses) ---
-#192.168.1.10            resolver-1
-#fd00::10                resolver-1-v6
-#192.168.1.11            resolver-2
-#fd00::11                resolver-2-v6
-
-# --- Light external reference ---
-1.1.1.1                  cloudflare
-2606:4700:4700::1111     cloudflare-v6
-8.8.8.8                  google
-2001:4860:4860::8888     google-v6
+9.9.9.9         quad9-v4
+2620:fe::fe     quad9-v6
+1.1.1.2         cloudflare-v4
+2606:4700:4700::1112 cloudflare-v6
+8.8.8.8         google-v4
+2001:4860:4860::8888 google-v6

@@ -1,6 +1,6 @@
-# Binaire compilé
+# Binaires compilés
 /dnsbench
-dnsbench
+/dnsbench-debug
 
 # Artefacts de build Swift
 .build/
@@ -13,5 +13,13 @@ dnsbench
 # Config interne (perso) — partir de dnsbench.conf.example
 dnsbench.conf
 
-# Rendu HTML d'un run interne (régénérable via --html)
-result.html
+# Rendus HTML (régénérables via --html)
+*.html
+
+# Campagnes de tests internes (scripts, diags, résultats) et journal de session
+/tests/
+/JOURNAL.md
+
+# Artefacts de build SwiftPM et binaires de distribution (releases GitHub)
+/.build/
+/dist/
