@@ -22,6 +22,14 @@ qtype = A
 # hit | miss | both
 mode = both
 
+# Base domain for cache-MISS: queries go to <12-hex-random>.<miss_base>.
+# Use a zone you control (or example.com); NXDOMAIN is the expected answer
+# and counts as a valid latency sample.
+# Keep every key = value line above the first [section]: a section runs until
+# the next one. 2.3 read a key placed inside [hit_domains] as a domain name;
+# since 2.5 a known key is honoured wherever it sits, with a message.
+miss_base = example.com
+
 # Sequential (closed-loop, default) or parallel (one in-flight query per
 # resolver, poll-based fan-out).
 parallel = no
@@ -36,12 +44,12 @@ www.apple.com
 www.wikipedia.org
 #example.com HTTPS
 
-# Base domain for cache-MISS: queries go to <12-hex-random>.<miss_base>.
-# Use a zone you control (or example.com); NXDOMAIN is the expected answer
-# and counts as a valid latency sample.
-miss_base = example.com
-
 # Resolvers to probe: address name, one per line. v4 and v6 mix freely.
+# A bare address is DNS over UDP, port 53. A scheme in front of it selects the
+# transport and allows a port (IPv6 literals in brackets):
+#   tcp://9.9.9.9   tcp://[2620:fe::fe]   udp://192.0.2.53:5353   tcp://192.0.2.53:5353
+# List a server under both forms to compare its transports in one run; --tcp
+# switches the whole panel to TCP without editing this file.
 [resolvers]
 9.9.9.9         quad9-v4
 2620:fe::fe     quad9-v6

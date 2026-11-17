@@ -73,6 +73,11 @@ resolver's latency is unaffected while the round collapses to ~max(RTT).
 Ready descriptors are processed in a per-batch random order (fixed order
 favoured early config entries by a few µs on fast LANs).
 
+UDP is the default and the reference: everything above describes it. A
+resolver can also be probed over TCP (`tcp://` in the conf, or `--tcp`) —
+same loop, same matching, the reply reassembled from the stream. What a
+TCP sample contains is spelled out under *Transport* below.
+
 **What the RTT contains.** `t1 − t0` is the application-level round trip:
 syscall, kernel UDP path, driver, NIC, wire, the resolver, and the same
 stack back. That is deliberate — it is what a real client pays — and,
@@ -148,9 +153,10 @@ ladder; the honest thing is to announce the rung.
 For each resolver: cache-HIT latency (rotating pre-warmed domains) and
 cache-MISS latency (unique random labels under a base you control — use a
 domain you own). Exact percentiles (min/p50/p90/p99/p99.9/max), mean, std,
-per-resolver error accounting (timeouts, network errors, per-RCODE counts —
-a SERVFAIL is not a latency sample), and a self-contained HTML report with
-CDF charts. Late replies are drained, never misattributed.
+per-resolver error accounting (timeouts, network errors, TCP connections
+closed by the server, per-RCODE counts — a SERVFAIL is not a latency sample),
+a self-contained HTML report with CDF charts, and the same results as JSON
+or CSV. Late replies are drained, never misattributed.
 
 - **cache-HIT**: pre-warmed domains, resolved hot — the cache service
   latency. The warm-up reads each answer's minimum TTL and warns below
@@ -272,6 +278,81 @@ state — so the instrument now lets you say which one you sample:
 - A tight two-entry conf is a warm probe; add `--gap 300` for a
   symmetric cold one.
 
+### Transport
+
+**`tcp://ADDR[:PORT]`** in `[resolvers]`, **`--tcp`** for the whole panel —
+DNS over TCP: length-prefixed messages on a stream (RFC 7766).
+`udp://ADDR:PORT` is plain UDP on another port, IPv6 literals go in
+brackets, and a bare address remains UDP port 53. These options did not
+come out of a campaign — they were suggested to us — but the reasons
+stand without numbers: TCP is what a stub falls back to when a UDP
+answer is truncated, and it is the substrate of DoT and DoH, so measuring
+it alone separates what the transport costs from what encryption adds.
+List a server twice — `ADDR` and `tcp://ADDR` — and both transports ride
+the same rotation, comparable round by round. That doubles the panel and
+the CDF has twelve colours: we ran one report per address family (`-4`,
+`-6`).
+
+The campaign came afterwards: five LAN resolvers, each listed over UDP
+and over TCP, 5000 rounds per mode on the `--spin` plane, differences
+taken round by round inside a run.
+
+- **A persistent connection costs nothing measurable.** Cache-HIT medians
+  over TCP sat between −110 and +22 µs of UDP, the sign depending on the
+  server: two of the five answered *faster* on a kept-open connection.
+- **A new connection per query is another matter.** +70 to +200 µs on
+  the three Technitium nodes; +6 to +7 ms on the two Pi-hole ones, which
+  otherwise answer in about a millisecond. dnsmasq serves every TCP
+  connection from a forked child, and Pi-hole's FTL reopens its gravity
+  database in it. The handshake itself returns in under a millisecond:
+  the cost sits between the query and the answer, it is CPU time on the
+  server (five sixths of it in the kernel, on the instance we
+  instrumented), and it drops by half or more when connections follow
+  one another without a pause. An independent socket client, sharing no
+  code with the probe, reads 7.9 and 9.3 ms where the probe reads 7.3
+  and 8.0. One caveat we have not resolved: both Pi-hole instances run
+  virtualized on ARM hosts, the Technitium ones in containers on x86 —
+  the mechanism is in the sources, how much of the figure belongs to the
+  platform is not established.
+- **Servers close connections on a schedule of their own.** The same two
+  close after 100 queries (dnsmasq's `TCP_MAX_QUERIES`): 100 closes per
+  entry over 10 003 queries, 85 to 94 of them found before the next
+  query, 6 to 15 with the query in flight — every one reopened or
+  repeated, counted, and none turned into a failure.
+
+The second point is the one a real client pays. A stub resolver only
+turns to TCP when a UDP answer comes back truncated, on a connection it
+opens for that query and closes after it: `--reconnect` is the client's
+number, the persistent connection a forwarder's.
+
+A TCP sample can mean two things, so there are two modes:
+
+- **warm** (default): one persistent connection per resolver, as a
+  forwarder or a resolver library keeps it. The sample is send → complete
+  reply, the same window as UDP.
+- **cold** (**`--reconnect`**): a new connection for every query, timed
+  from `connect()` — handshake plus query, one more round trip by
+  construction. Sequential only (it forces it).
+
+Servers close connections whenever they like, and the probe takes it the
+way a client lives it. *Closed while idle*: checked before every `t0` and
+reopened outside the timed window — the next sample simply rides a new
+connection. *Closed with the query in flight*: the probe connects again
+and repeats the query, once, clock running, as RFC 7766 asks of a
+client — that sample spans the lost attempt, the handshake and the
+answer, exactly what a stub would have waited. Neither is hidden: the run
+ends with a note per resolver for each kind, and the JSON carries both
+counters (`reconnects`, `retried`). Only a second close on the same query
+becomes a `fail`, listed as `closed` in the anomalies. A server that
+closes after every answer is one to probe with `--reconnect`.
+
+`--spin` and `--rt` apply to TCP. `--kts` does not: kernel RX timestamps
+are enabled on datagram sockets only, TCP samples take `t1` in user
+space, and a mixed `--kts` panel says so at startup — compare UDP and
+TCP rows on the default or the `--spin` plane.
+
+DoT and DoH come next: this stream code is their substrate.
+
 ### Accuracy planes
 
 The default measurement takes `t1` in user space, after the scheduler has
@@ -346,6 +427,22 @@ breakdown. We needed the CDF the day a resolver's latency turned out
 bimodal: a mean hides it, a percentile table half-hides it, a step in the
 curve shows it.
 
+**`--json FILE`**, **`--csv FILE`** — the same results, for machines. Our
+campaign runner used to rebuild a summary table by scraping the console
+output with awk; the instrument now writes it. `--csv` is that table:
+the console columns and units, one row per resolver and mode, and a
+leading `run` column so that the files of a campaign concatenate.
+`--json` is the whole run under a versioned schema — options, clock
+calibration, per-resolver statistics in integer nanoseconds, the anomaly
+breakdown — and with **`--samples`** every raw sample in measurement
+order, so a distribution can be re-plotted without re-running. `-` as
+FILE writes to stdout and moves the console report to stderr:
+`./dnsbench --json - | jq '.resolvers[] | {name, p50: .hit.p50}'`.
+
+**`--label TEXT`** — names the run: JSON `label`, CSV `run` column
+(default: the UTC start time). Same lesson as `--version` below: a
+results file must say what it is.
+
 **`-v` / `--verbose`** — echo the parsed resolver addresses at startup.
 This replaces v1's forked "debug" source file, which `make debug` used to
 compile over the release binary.
@@ -369,7 +466,7 @@ results file now identifies itself.
 | `parallel` | `yes` for poll-based fan-out | `--parallel` / `--no-parallel` |
 | `[hit_domains]` | one `name [qtype]` per line, rotated round-robin; prefer long TTLs | — |
 | `miss_base` | zone under which the random MISS label is prefixed | — |
-| `[resolvers]` | one `address name` per line, v4 and v6 mixed freely | `-4` / `-6` filter |
+| `[resolvers]` | one `address name` per line, v4 and v6 mixed freely; `tcp://` or `udp://` in front of the address selects the transport and allows `:PORT` | `-4` / `-6` filter, `--tcp` |
 
 ### Recipes
 
@@ -382,6 +479,10 @@ results file now identifies itself.
     ./dnsbench -c pair.conf --gap 300 --rounds 500      # symmetric cold probe (two-entry conf)
     ./dnsbench --order v4-first ; ./dnsbench --order v6-first   # families at equal thermal state
     ./dnsbench --fixed-order                            # reproduce a v2.2-era campaign
+    ./dnsbench --tcp --mode hit                         # the same panel over TCP, warm connections
+    ./dnsbench --tcp --reconnect --mode hit             # TCP with a handshake per query
+    ./dnsbench -c both.conf -4 --spin --html tcp4.html  # ADDR and tcp://ADDR per server: UDP vs TCP, same rounds
+    ./dnsbench --label weekly --json run.json --samples # everything, for a dashboard or a notebook
 
 When comparing two settings, run them ABAB — never AAAA then BBBB — and
 call the difference real only when |Δp50| exceeds the spread between
@@ -454,11 +555,13 @@ the inter-repetition spread on both sides.
 
 **Reading the results.** Two tables (HIT/MISS) in ms with µs precision:
 `n`, `fail`, `err`, `min / p50 / p90 / p99 / p99.9 / max / mean / std`, and
-`vs` (ratio to the fastest on the `--sort` metric). Read the percentiles,
-not the mean. A resolver with `n=0` and `fail=<rounds>` was unreachable
-over that transport — a useful connectivity check in its own right. The
-anomalies section lists, per resolver, everything that was excluded from
-the samples and why.
+`vs` (ratio to the fastest on the `--sort` metric). `fail` counts timeouts,
+network errors and TCP queries whose connection was closed twice; `err`
+counts replies whose RCODE is neither NOERROR nor NXDOMAIN. Read the
+percentiles, not the mean. A resolver with `n=0` and `fail=<rounds>` was
+unreachable over that transport — a useful connectivity check in its own
+right. The anomalies section lists, per resolver, everything that was
+excluded from the samples and why.
 
 **Reading the CDF curves.** A curve further left is faster; percentiles
 read off directly (X is log-scaled, v4 solid, v6 dashed). Steps mean a
@@ -478,7 +581,8 @@ deterministic path.
 
 `dnsbench.conf.example` documents every key. Progress goes to **stderr**
 (rounds, requests, fails, req/s), results to **stdout**, so
-`./dnsbench --sort p99 > run.txt` keeps a clean record.
+`./dnsbench --sort p99 > run.txt` keeps a clean record. `--json -` or
+`--csv -` take stdout for themselves and move the report to stderr.
 
 ## Critique welcome
 

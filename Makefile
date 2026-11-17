@@ -4,6 +4,7 @@
 #   make run             build + run with ./dnsbench.conf
 #   make debug           debug build -> ./dnsbench-debug (does NOT overwrite the release binary)
 #   make static-stdlib   Linux/glibc: embed the Swift runtime (drop-anywhere on same-arch distros)
+#   make macos-arm64     macOS release asset, pinned deployment target -> dist/dnsbench-macos-arm64
 #   make linux-arm64     static musl cross-build -> dist/dnsbench-linux-arm64
 #   make linux-amd64     static musl cross-build -> dist/dnsbench-linux-amd64
 #   make clean
@@ -13,11 +14,12 @@ SWIFTFLAGS ?= -O
 BIN        := dnsbench
 SRC        := dnsbench.swift
 CONF       := dnsbench.conf
+MACOS_TARGET ?= arm64-apple-macos26.0
 
 $(BIN): $(SRC)
 	$(SWIFTC) $(SWIFTFLAGS) $(SRC) -o $(BIN)
 
-.PHONY: run debug static-stdlib linux-arm64 linux-amd64 clean
+.PHONY: run debug static-stdlib macos-arm64 linux-arm64 linux-amd64 clean
 
 run: $(BIN)
 	./$(BIN) $(CONF)
@@ -31,6 +33,14 @@ debug: $(SRC)
 # Linux only: statically link the Swift runtime into the binary (glibc build).
 static-stdlib: $(SRC)
 	$(SWIFTC) $(SWIFTFLAGS) -static-stdlib $(SRC) -o $(BIN)
+
+# macOS release asset. A plain `make` targets the build host's OS version, so
+# a binary built on a newer macOS refuses to start on an older one; the asset
+# pins the deployment target instead.
+macos-arm64: $(SRC)
+	@mkdir -p dist
+	$(SWIFTC) $(SWIFTFLAGS) -target $(MACOS_TARGET) $(SRC) -o dist/dnsbench-macos-arm64
+	@echo "-> dist/dnsbench-macos-arm64"
 
 # --- Cross-compilation (Swift Static Linux SDK, swift.org) ---------------
 #   Prerequisite (once):

@@ -30,24 +30,33 @@
 //   - new: --timeout-ms, --gap (pacing), --spin, --edns, --rt, --verbose
 //   - v2.4: machine-readable output - --json (the whole run, versioned schema,
 //     integer nanoseconds), --csv (the summary tables), --samples, --label
+//   - v2.5: DNS over TCP - tcp://ADDR[:PORT] entries or --tcp for the whole
+//     panel; persistent connections (warm) or --reconnect (handshake + query);
+//     udp:// and tcp:// entries accept a port
 //
 // Build: see Makefile (swiftc -O dnsbench.swift -o dnsbench).
 // Usage: ./dnsbench [-c FILE] [--rounds N] [--qtype A|AAAA|HTTPS|N] [--mode hit|miss|both]
 //                   [--sort KEY] [--html FILE] [--json FILE] [--csv FILE]
-//                   [--gap MS] [--spin] [--edns] [--rt] [-v] [-h]
+//                   [--tcp] [--reconnect] [--gap MS] [--spin] [--edns] [--rt] [-v] [-h]
 
 #if canImport(Darwin)
 import Darwin
 let SOCK_DGRAM_VAL = SOCK_DGRAM            // Int32 on Darwin
+let SOCK_STREAM_VAL = SOCK_STREAM
+let SEND_FLAGS: Int32 = 0                  // SIGPIPE is disabled per socket (SO_NOSIGPIPE)
 #elseif canImport(Musl)
 import Musl
 let SOCK_DGRAM_VAL = SOCK_DGRAM            // plain Int32 on Musl (static SDK)
+let SOCK_STREAM_VAL = SOCK_STREAM
+let SEND_FLAGS = Int32(MSG_NOSIGNAL)       // no SIGPIPE on a connection the server closed
 #elseif canImport(Glibc)
 import Glibc
 let SOCK_DGRAM_VAL = Int32(SOCK_DGRAM.rawValue)   // enum on Glibc
+let SOCK_STREAM_VAL = Int32(SOCK_STREAM.rawValue)
+let SEND_FLAGS = Int32(MSG_NOSIGNAL)
 #endif
 
-let VERSION = "2.4"
+let VERSION = "2.5"
 
 // ───────────────────────────── Monotonic clock ─────────────────────────────
 @inline(__always)
@@ -103,6 +112,10 @@ func orderMark() -> String {
     }
 }
 var ctrlBuf = [UInt8](repeating: 0, count: 64)   // cmsg scratch (single entry)
+// Stream transport (TCP): per-entry reassembly state, allocated once at startup
+// (left empty for datagram entries). See "Stream transport" below.
+var streamBuf: [[UInt8]] = []
+var streamHave: [Int] = []
 #if canImport(Darwin)
 let (tbNumer, tbDenom): (UInt64, UInt64) = {
     var info = mach_timebase_info_data_t()
@@ -215,6 +228,9 @@ func trim(_ s: Substring) -> Substring {
     return s[a..<b]
 }
 
+let settingKeys: Set<String> = ["rounds", "timeout_sec", "timeout_ms", "gap_ms", "edns", "hit_domain",
+                                "miss_base", "qtype", "mode", "parallel"]
+
 func loadConfig(_ path: String) -> Config? {
     guard let text = readFile(path) else { return nil }
     var c = Config()
@@ -226,12 +242,24 @@ func loadConfig(_ path: String) -> Config? {
         let t = trim(line)
         if t.isEmpty { continue }
         if t.first == "[" { section = String(t.dropFirst().dropLast()); continue }
-        if section == "resolvers" {
+        // A setting stays a setting wherever it sits. Up to 2.3 a section ran
+        // to the next one whatever it held, so `miss_base = x` written after
+        // [hit_domains] - as the 2.3 example file had it - became a hit domain
+        // named "miss_base", and the MISS base silently kept its default.
+        var isSetting = false
+        if let eq = t.firstIndex(of: "=") {
+            let key = String(trim(t[t.startIndex..<eq]))
+            isSetting = settingKeys.contains(key)
+            if isSetting && !section.isEmpty {
+                fputs("dnsbench: config: '\(key)' sits inside [\(section)] - read as a setting (2.3 took it for an entry of that section); move it above the first [section]\n", stderr)
+            }
+        }
+        if section == "resolvers" && !isSetting {
             let p = t.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
             if p.count >= 2 { c.resolvers.append((p[0], p[1])) } else if p.count == 1 { c.resolvers.append((p[0], p[0])) }
             continue
         }
-        if section == "hit_domains" {
+        if section == "hit_domains" && !isSetting {
             let p = t.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
             if p.isEmpty { continue }
             if p.count >= 2 {
@@ -293,6 +321,36 @@ func buildQuery(id: UInt16, name: String, qtype: UInt16, edns: Bool) -> [UInt8] 
 }
 
 // ───────────────────────── Address resolution (v4/v6) ─────────────────────────
+// [resolvers] address syntax. A bare IP literal is plain DNS over UDP, port 53
+// (the historical form, unchanged). A scheme selects the transport and allows
+// a port:   udp://192.0.2.1:5353   tcp://192.0.2.1   tcp://[2001:db8::1]:5353
+// Any other scheme is refused here rather than silently probed over UDP.
+enum Transport { case udp, tcp }
+
+func parseTarget(_ spec: String) -> (transport: Transport, host: String, port: UInt16)? {
+    var transport = Transport.udp
+    let rest: Substring
+    if spec.hasPrefix("udp://") { rest = spec.dropFirst(6) }
+    else if spec.hasPrefix("tcp://") { transport = .tcp; rest = spec.dropFirst(6) }
+    else if spec.utf8.contains(UInt8(ascii: "/")) { return nil }
+    else { return (.udp, spec, 53) }                   // bare literal: never carries a port
+    var host = rest
+    var port: UInt16 = 53
+    if rest.first == "[" {                             // [v6] or [v6]:port
+        guard let close = rest.firstIndex(of: "]") else { return nil }
+        host = rest[rest.index(after: rest.startIndex)..<close]
+        let tail = rest[rest.index(after: close)...]
+        if !tail.isEmpty {
+            guard tail.first == ":", let p = UInt16(tail.dropFirst()), p > 0 else { return nil }
+            port = p
+        }
+    } else if rest.utf8.filter({ $0 == UInt8(ascii: ":") }).count == 1, let c = rest.firstIndex(of: ":") {
+        guard let p = UInt16(rest[rest.index(after: c)...]), p > 0 else { return nil }   // v4:port
+        host = rest[..<c]; port = p
+    }
+    return host.isEmpty ? nil : (transport, String(host), port)
+}
+
 func resolveSockaddr(_ ip: String, _ port: UInt16) -> (sockaddr_storage, socklen_t, Int32)? {
     var hints = addrinfo()
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_DGRAM_VAL; hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV
@@ -331,13 +389,15 @@ func openConnectedSocket(addr: inout sockaddr_storage, addrlen: socklen_t, famil
 }
 
 // ───────────────────────────── Probing ─────────────────────────────
-enum Probe { case ok(UInt64); case rcode(UInt64, UInt8); case timeout; case netErr }
+enum Probe { case ok(UInt64); case rcode(UInt64, UInt8); case timeout; case netErr; case closed }
 
 // NOERROR and NXDOMAIN are valid latency samples (NXDOMAIN is the expected MISS
 // answer). Anything else (SERVFAIL, REFUSED, ...) measures a failure path -
 // e.g. Pi-hole FTL rate-limiting answers REFUSED - and lands in `err`.
 // Timeouts and network errors (ICMP unreachable, send failures) land in
-// `fail`. Both are broken down per kind in the anomalies report.
+// `fail`, and so does `closed`: a stream query whose connection the server
+// closed or reset twice - a first close only makes the probe ask again. Both
+// are broken down per kind in the anomalies report.
 @inline(__always) func rcodeValid(_ rc: UInt8) -> Bool { rc == 0 || rc == 3 }
 
 func rcodeName(_ rc: Int) -> String {
@@ -456,7 +516,12 @@ func measureOnce(fd: Int32, query: [UInt8], expectId: UInt16,
 // replies landing in the same poll() batch on a fast LAN, fixed ordering
 // systematically favoured early [resolvers] entries by a few us. EINTR is
 // retried; POLLERR (ICMP) counts as fail; RCODE handled as in sequential mode.
-func fanPhase(fds: [Int32], template: inout [UInt8], labelOffset: Int?,
+// Stream entries (TCP, persistent connections) ride the same fan-out: the
+// template leaves length-prefixed, the reply is reassembled on POLLIN. A
+// stream closed with its query in flight is redialled without blocking the
+// batch (`stage`: 0 first attempt, 1 reconnecting, 2 query repeated) and its
+// query repeated once, t0 unchanged - see "Stream transport".
+func fanPhase(fds: inout [Int32], streams: [Bool], stage: inout [UInt8], template: inout [UInt8], labelOffset: Int?,
               rng: inout XorShift64, timeoutMs: Int, recvBuf: inout [UInt8],
               ids: inout [UInt16], t0: inout [UInt64], pfds: inout [pollfd],
               order: inout [Int], results: inout [Probe?]) {
@@ -475,16 +540,34 @@ func fanPhase(fds: [Int32], template: inout [UInt8], labelOffset: Int?,
     }
     for oi in 0..<n {
         let i = order[oi]
-        results[i] = nil
+        results[i] = nil; stage[i] = 0
         pfds[i].fd = -1; pfds[i].events = Int16(POLLIN); pfds[i].revents = 0
         if fds[i] < 0 { results[i] = .netErr; continue }
         let id = rng.nextId()
         ids[i] = id
         patchId(&template, id)
         if let lo = labelOffset { patchLabel(&template, lo, &rng) }
-        t0[i] = probeNow()
-        let sent = template.withUnsafeBytes { qb in send(fds[i], qb.baseAddress, qb.count, 0) }
-        if sent >= 0 { pfds[i].fd = fds[i]; pending += 1 } else { results[i] = .netErr }
+        let sent: Bool
+        if streams[i] {
+            t0[i] = probeNow()
+            sent = streamSend(fds[i], template)
+            if !sent {                                 // closed under the send: redial, or give up
+                let lost = streamReset(errno)
+                close(fds[i]); fds[i] = -1
+                if lost, let nfd = streamRedial(i) {
+                    fds[i] = nfd; streamHave[i] = 0
+                    pfds[i].fd = nfd; pfds[i].events = Int16(POLLOUT); stage[i] = 1
+                    pending += 1
+                } else {
+                    results[i] = lost ? .closed : .netErr
+                }
+                continue
+            }
+        } else {
+            t0[i] = probeNow()
+            sent = template.withUnsafeBytes { qb in send(fds[i], qb.baseAddress, qb.count, 0) } >= 0
+        }
+        if sent { pfds[i].fd = fds[i]; pending += 1 } else { results[i] = .netErr }
     }
     let deadline = probeNow() &+ UInt64(timeoutMs) &* 1_000_000
     while pending > 0 {
@@ -507,6 +590,42 @@ func fanPhase(fds: [Int32], template: inout [UInt8], labelOffset: Int?,
             let rev = Int32(pfds[i].revents)
             if rev == 0 { continue }
             pfds[i].revents = 0
+            if streams[i] {
+                if stage[i] == 1 {                         // the redial completed, one way or the other
+                    if connectDone(fds[i]) {
+                        patchId(&template, ids[i])
+                        if let lo = labelOffset { patchLabel(&template, lo, &rng) }
+                        if streamSend(fds[i], template) {
+                            pfds[i].events = Int16(POLLIN); stage[i] = 2
+                            continue
+                        }
+                    }
+                    results[i] = .netErr
+                    close(fds[i]); fds[i] = -1         // reopened before the next phase
+                    pfds[i].fd = -1; pending -= 1
+                    continue
+                }
+                let m = streamFill(fds[i], &streamBuf[i], streamHave[i])
+                let t1 = probeNow()
+                if m > 0 {
+                    streamHave[i] += m
+                    if let r = streamTake(&streamBuf[i], &streamHave[i], ids[i], wantTTL: false) {
+                        results[i] = rcodeValid(r.rcode) ? .ok(t1 &- t0[i]) : .rcode(t1 &- t0[i], r.rcode)
+                        pfds[i].fd = -1; pending -= 1
+                    }
+                } else if m == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    let lost = m == 0 || streamReset(errno)
+                    if lost && stage[i] == 0, let nfd = streamRedial(i) {
+                        close(fds[i]); fds[i] = nfd; streamHave[i] = 0
+                        pfds[i].fd = nfd; pfds[i].events = Int16(POLLOUT); stage[i] = 1
+                    } else {
+                        results[i] = lost ? .closed : .netErr
+                        close(fds[i]); fds[i] = -1         // reopened before the next phase
+                        pfds[i].fd = -1; pending -= 1
+                    }
+                }
+                continue
+            }
             if (rev & POLLIN) != 0 {
                 let (m, kt) = recvWithTS(fd: fds[i], buf: &recvBuf)
                 let t1 = kt ?? probeNow()
@@ -602,6 +721,226 @@ func warmupProbe(fd: Int32, query: [UInt8], expectId: UInt16,
     }
 }
 
+// ───────────────────────── Stream transport (TCP) ─────────────────────────
+// DNS over TCP (RFC 1035 4.2.2, RFC 7766): every message is preceded by a
+// two-byte length. Two ways to sample it, because a client can experience two
+// different things:
+//   - warm (default): one persistent connection per resolver, as a forwarder
+//     or a resolver library keeps it. The sample is send -> complete reply,
+//     the same window as UDP. The server may close an idle connection at any
+//     time (RFC 7766): an idle close is detected, and the connection reopened,
+//     BEFORE t0.
+//   - cold (--reconnect): a new connection per query. t0 is taken before
+//     connect(): the sample is handshake + query, what a stub falling back
+//     from a truncated UDP answer pays.
+// When the server closes or resets a connection with a query in flight, the
+// probe does what a client should (RFC 7766 6.2.4): it connects again and
+// repeats the query - once, inside the same timed window and timeout budget. That sample
+// spans the lost attempt, the handshake and the query, and the query is
+// counted `retried`. A second close makes it a `closed` fail.
+// Replies are reassembled across segments. A complete message that does not
+// answer the current query (late reply to a query that timed out) is dropped,
+// like stale datagrams on the UDP path. Kernel RX timestamps (--kts) remain a
+// datagram facility: stream samples take t1 in user space.
+let streamCap = 2 + 65535                              // length prefix + largest DNS message
+
+enum ConnectResult { case ok, timeout, failed }
+
+// Non-blocking TCP socket, not yet connected. TCP_NODELAY: the one small write
+// of a query must leave at once.
+func makeStreamSocket(family: Int32, busyPoll: Bool) -> Int32 {
+    let fd = socket(family, SOCK_STREAM_VAL, 0)
+    if fd < 0 { return -1 }
+    var one: Int32 = 1
+    setsockopt(fd, Int32(IPPROTO_TCP), TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+#if canImport(Darwin)
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+#else
+    if busyPoll {
+        var us: Int32 = 50
+        setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &us, socklen_t(MemoryLayout<Int32>.size))
+    }
+#endif
+    let fl = fcntl(fd, F_GETFL, 0); _ = fcntl(fd, F_SETFL, fl | O_NONBLOCK)
+    return fd
+}
+
+// Start a non-blocking connect; false when it fails at once. Completion shows
+// as writability, and connectDone() then tells how it went.
+func beginConnect(_ fd: Int32, _ addr: inout sockaddr_storage, _ addrlen: socklen_t) -> Bool {
+    let rc = withUnsafePointer(to: &addr) { ap in
+        ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sap in
+            connect(fd, sap, addrlen)
+        }
+    }
+    return rc == 0 || errno == EINPROGRESS || errno == EINTR
+}
+
+func connectDone(_ fd: Int32) -> Bool {
+    var soErr: Int32 = 0
+    var soLen = socklen_t(MemoryLayout<Int32>.size)
+    return getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &soLen) == 0 && soErr == 0
+}
+
+// Connect bounded by `deadline` (probe clock): a filtered port must cost the
+// configured timeout, not the OS default of a minute or more. --spin
+// busy-polls instead of sleeping, as on the receive side.
+func connectStream(_ fd: Int32, _ addr: inout sockaddr_storage, _ addrlen: socklen_t,
+                   deadline: UInt64, spin: Bool) -> ConnectResult {
+    if !beginConnect(fd, &addr, addrlen) { return .failed }
+    var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+    while true {
+        let now = probeNow()
+        if now >= deadline { return .timeout }
+        let remMs = Int32(min(UInt64(Int32.max), (deadline &- now) / 1_000_000))
+        let pr = poll(&pfd, 1, spin ? 0 : (remMs > 0 ? remMs : 1))
+        if pr < 0 { if errno == EINTR { continue }; return .failed }
+        if pr == 0 { continue }                        // loop re-checks the deadline
+        return connectDone(fd) ? .ok : .failed
+    }
+}
+
+// Leave a connected stream in the mode the run uses: blocking under
+// SO_RCVTIMEO, or non-blocking (--parallel, --spin).
+func settleStream(_ fd: Int32, timeoutMs: Int, nonblocking: Bool) {
+    if nonblocking { return }
+    let fl = fcntl(fd, F_GETFL, 0); _ = fcntl(fd, F_SETFL, fl & ~O_NONBLOCK)
+    setRcvTimeoutMs(fd, timeoutMs)
+}
+
+// Open + connect within `timeoutMs`, outside any timed window.
+func openStream(addr: inout sockaddr_storage, addrlen: socklen_t, family: Int32,
+                timeoutMs: Int, nonblocking: Bool, busyPoll: Bool) -> (fd: Int32, result: ConnectResult) {
+    let fd = makeStreamSocket(family: family, busyPoll: busyPoll)
+    if fd < 0 { return (-1, .failed) }
+    let r = connectStream(fd, &addr, addrlen, deadline: probeNow() &+ UInt64(timeoutMs) &* 1_000_000, spin: false)
+    if r != .ok { close(fd); return (-1, r) }
+    settleStream(fd, timeoutMs: timeoutMs, nonblocking: nonblocking)
+    return (fd, .ok)
+}
+
+// A retry inside the parallel fan-out cannot block on a handshake: start a
+// non-blocking connect to entry i's address; fanPhase resumes on writability.
+func streamRedial(_ i: Int) -> Int32? {
+    let fd = makeStreamSocket(family: fams[i], busyPoll: rtFlag)
+    if fd < 0 { return nil }
+    if !beginConnect(fd, &sas[i], salens[i]) { close(fd); return nil }
+    return fd
+}
+
+// errno of a stream the peer has closed or reset (as opposed to a network error).
+@inline(__always) func streamReset(_ e: Int32) -> Bool { e == ECONNRESET || e == EPIPE }
+
+// Has the server closed this idle connection? Checked before t0. Pending bytes
+// are a late reply, not a close: the next exchange drops them. The check
+// cannot be airtight - a close that crosses the next query on the wire is
+// only seen after the send: the exchange then reports `closed`, and the
+// caller asks again on a new connection.
+func streamStale(_ fd: Int32) -> Bool {
+    var b: UInt8 = 0
+    let n = recv(fd, &b, 1, Int32(MSG_PEEK) | Int32(MSG_DONTWAIT))
+    if n > 0 { return false }
+    if n == 0 { return true }                          // orderly close
+    return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+}
+
+// Length-prefixed send of the shared datagram template: prefix and message
+// leave in one sendmsg(), hence one segment - no second template set.
+@inline(__always)
+func streamSend(_ fd: Int32, _ query: [UInt8]) -> Bool {
+    var prefix: (UInt8, UInt8) = (UInt8(truncatingIfNeeded: query.count >> 8), UInt8(truncatingIfNeeded: query.count))
+    return query.withUnsafeBytes { qb -> Bool in
+        withUnsafeMutableBytes(of: &prefix) { pb -> Bool in
+            var iov = (iovec(iov_base: pb.baseAddress, iov_len: 2),
+                       iovec(iov_base: UnsafeMutableRawPointer(mutating: qb.baseAddress), iov_len: qb.count))
+            return withUnsafeMutablePointer(to: &iov) { ip -> Bool in
+                ip.withMemoryRebound(to: iovec.self, capacity: 2) { iovp -> Bool in
+                    var msg = msghdr()
+                    msg.msg_iov = iovp
+                    msg.msg_iovlen = numericCast(2)
+                    return sendmsg(fd, &msg, SEND_FLAGS) == 2 + qb.count
+                }
+            }
+        }
+    }
+}
+
+// One recv() appended to the reassembly buffer; returns what recv returned.
+@inline(__always)
+func streamFill(_ fd: Int32, _ buf: inout [UInt8], _ have: Int) -> Int {
+    buf.withUnsafeMutableBytes { rb in recv(fd, rb.baseAddress! + have, rb.count - have, 0) }
+}
+
+// Complete messages at the head of the buffer: the one answering `expectId`
+// returns its RCODE (and, at warm-up, the answer's min TTL); any other is
+// dropped. nil = the reply is not complete yet.
+func streamTake(_ buf: inout [UInt8], _ have: inout Int, _ expectId: UInt16,
+                wantTTL: Bool) -> (rcode: UInt8, ttl: UInt32?)? {
+    while have >= 2 {
+        let len = Int(buf[0]) << 8 | Int(buf[1])
+        let total = 2 + len
+        if have < total { return nil }
+        let match = len >= 12 && (UInt16(buf[2]) << 8 | UInt16(buf[3])) == expectId && (buf[4] & 0x80) != 0
+        let rcode = match ? buf[5] & 0x0F : 0
+        let ttl = match && wantTTL ? minAnswerTTL(Array(buf[2..<total]), len) : nil
+        let rest = have - total
+        if rest > 0 { buf.withUnsafeMutableBytes { rb in _ = memmove(rb.baseAddress, rb.baseAddress! + total, rest) } }
+        have = rest
+        if match { return (rcode, ttl) }
+    }
+    return nil
+}
+
+// One query on a connected stream: send, then read until the matching reply is
+// complete. `t0` is given when the timed window opened earlier (cold mode:
+// before connect()), taken here otherwise. Blocking sockets sleep in recv()
+// under SO_RCVTIMEO - the happy path is one send + one recv, like UDP - and
+// the timeout is only re-armed when a reply arrives in pieces or a stale one
+// is dropped. Non-blocking sockets poll(), or busy-loop under --spin.
+// `alive` tells the caller whether the connection can carry the next query,
+// `t0` when the window opened - a retry after a close keeps it.
+func streamExchange(fd: Int32, query: [UInt8], expectId: UInt16, t0 opened: UInt64?,
+                    timeoutMs: Int, nonblock: Bool, spin: Bool, wantTTL: Bool,
+                    buf: inout [UInt8], have: inout Int) -> (probe: Probe, alive: Bool, ttl: UInt32?, t0: UInt64) {
+    let t0 = opened ?? probeNow()
+    if !streamSend(fd, query) { return (streamReset(errno) ? .closed : .netErr, false, nil, t0) }
+    let deadline = t0 &+ UInt64(timeoutMs) &* 1_000_000
+    var shrunk = false
+    defer { if shrunk { setRcvTimeoutMs(fd, timeoutMs) } }
+    var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+    while true {
+        if nonblock && !spin {
+            let now = probeNow()
+            if now >= deadline { return (.timeout, true, nil, t0) }
+            let remMs = Int32(min(UInt64(Int32.max), (deadline &- now) / 1_000_000))
+            _ = poll(&pfd, 1, remMs > 0 ? remMs : 1)
+        }
+        let n = streamFill(fd, &buf, have)
+        let t1 = probeNow()
+        if n > 0 {
+            have += n
+            if let r = streamTake(&buf, &have, expectId, wantTTL: wantTTL) {
+                return (rcodeValid(r.rcode) ? .ok(t1 &- t0) : .rcode(t1 &- t0, r.rcode), true, r.ttl, t0)
+            }
+        } else if n == 0 {
+            return (.closed, false, nil, t0)           // closed by the server, query in flight
+        } else {
+            let e = errno
+            if e == EAGAIN || e == EWOULDBLOCK {
+                if !nonblock { return (.timeout, true, nil, t0) } // SO_RCVTIMEO expiry
+            } else if e != EINTR {
+                return (streamReset(e) ? .closed : .netErr, false, nil, t0)
+            }
+        }
+        if t1 >= deadline { return (.timeout, true, nil, t0) }
+        if !nonblock {
+            let remMs = Int((deadline &- t1) / 1_000_000)
+            setRcvTimeoutMs(fd, remMs > 0 ? remMs : 1)
+            shrunk = true
+        }
+    }
+}
+
 func sleepMs(_ ms: Int) {
     if ms <= 0 { return }
     var ts = timespec()
@@ -650,8 +989,10 @@ struct Acc {
     var samples: [UInt64] = []
     var timeouts = 0
     var netErrs = 0                                    // ICMP unreachable, send errors
+    var closes = 0                                     // stream closed by the server, twice for one query
+    var retried = 0                                    // stream queries repeated after a close (not a fail)
     var rcodeCounts = [Int](repeating: 0, count: 16)   // invalid RCODEs by value
-    var fails: Int { timeouts + netErrs }
+    var fails: Int { timeouts + netErrs + closes }
     var rcodeErrs: Int { rcodeCounts.reduce(0, +) }
 }
 
@@ -720,6 +1061,7 @@ func failDesc(_ a: Acc) -> String? {
     var parts = [String]()
     if a.timeouts > 0 { parts.append("\(a.timeouts) timeout") }
     if a.netErrs > 0 { parts.append("\(a.netErrs) net-err") }
+    if a.closes > 0 { parts.append("\(a.closes) closed") }
     return parts.isEmpty ? nil : parts.joined(separator: ", ")
 }
 func rcodeDesc(_ a: Acc) -> String? {
@@ -872,7 +1214,7 @@ func writeHTML(_ path: String, _ cfg: Config, _ names: [String], _ isV6: [Bool],
     d += "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>dnsbench results</title>"
     d += "<style>\(css)</style></head><body><h1>dnsbench results</h1>"
     d += "<p class=\"meta\">dnsbench v\(VERSION) &middot; \(nowString()) &middot; \(names.count) resolvers &middot; \(cfg.rounds) rounds/mode &middot; "
-    d += "default qtype \(qtypeName(cfg.qtype)) &middot; timeout \(cfg.timeoutMs) ms\(cfg.gapMs > 0 ? " &middot; gap \(cfg.gapMs) ms" : "")\(cfg.edns ? " &middot; EDNS0" : "")\(ktsActive ? " &middot; kernel RX ts" : "")\(orderMark())\(familyOnly == AF_INET ? " &middot; IPv4 only" : (familyOnly == AF_INET6 ? " &middot; IPv6 only" : "")) &middot; vs/sort on \(metricName(refMetric)) &middot; "
+    d += "default qtype \(qtypeName(cfg.qtype)) &middot; timeout \(cfg.timeoutMs) ms\(cfg.gapMs > 0 ? " &middot; gap \(cfg.gapMs) ms" : "")\(cfg.edns ? " &middot; EDNS0" : "")\(ktsActive ? " &middot; kernel RX ts" : "")\(tcpFlag ? " &middot; TCP" : "")\(reconnectFlag && isStream.contains(true) ? " &middot; reconnect per query" : "")\(orderMark())\(familyOnly == AF_INET ? " &middot; IPv4 only" : (familyOnly == AF_INET6 ? " &middot; IPv6 only" : "")) &middot; vs/sort on \(metricName(refMetric)) &middot; "
     d += "clock ~\(clkCost) ns/call, res \(clkRes) ns &middot; MISS &lt;rand&gt;.\(he(cfg.missBase))</p>"
     if cfg.mode != .miss {
         d += htmlTable("cache-HIT (ms)", hit, names, hOrd, refMetric)
@@ -899,9 +1241,22 @@ func writeHTML(_ path: String, _ cfg: Config, _ names: [String], _ isV6: [Bool],
             d += "<p class=\"foot\">REFUSED from a Pi-hole is typically FTL rate limiting (default 1000 q / 60 s per client) - consider --gap.</p>"
         }
     }
+    // What the servers did to the TCP connections - nothing here is excluded.
+    var reopened = [String](), repeated = [String]()
+    for i in names.indices {
+        if reconns[i] > 0 { reopened.append("\(he(names[i])) \(reconns[i])") }
+        let rep = (cfg.mode != .miss ? hit[i].retried : 0) + (cfg.mode != .hit ? miss[i].retried : 0)
+        if rep > 0 { repeated.append("\(he(names[i])) \(rep)") }
+    }
+    if !reopened.isEmpty {
+        d += "<p class=\"foot\">TCP connections closed by the server while idle, reopened before t0 (outside the samples): \(reopened.joined(separator: ", ")).</p>"
+    }
+    if !repeated.isEmpty {
+        d += "<p class=\"foot\">TCP connections closed by the server mid-query, query repeated on a new connection (those samples include the lost attempt and the handshake): \(repeated.joined(separator: ", ")).</p>"
+    }
     d += "<p class=\"foot\">Values in ms. CDF: a curve further left = faster; v4 solid, v6 dashed; X is log-scaled and "
     d += "clipped at p99. Bars/vs scale to the fastest on \(metricName(refMetric)). Red rows were unreachable. "
-    d += "fail counts timeouts and network errors (ICMP unreachable, send failures); err counts replies whose RCODE is neither NOERROR nor NXDOMAIN (SERVFAIL, REFUSED, ...). Both are excluded from the latency samples - hover a fail/err cell for the per-kind breakdown.</p></body></html>"
+    d += "fail counts timeouts, network errors (ICMP unreachable, send failures) and TCP queries whose connection the server closed twice (a first close is retried); err counts replies whose RCODE is neither NOERROR nor NXDOMAIN (SERVFAIL, REFUSED, ...). Both are excluded from the latency samples - hover a fail/err cell for the per-kind breakdown.</p></body></html>"
 
     let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode_t(0o644))
     if fd < 0 { fputs("dnsbench: cannot write HTML: \(path)\n", stderr); return }
@@ -985,7 +1340,8 @@ func jsonPhase(_ a: Acc, _ best: UInt64, _ refMetric: SortKey, _ withSamples: Bo
     for rc in 0..<16 where a.rcodeCounts[rc] > 0 { rcodes.append("\(jsonString(rcodeName(rc))): \(a.rcodeCounts[rc])") }
     let ratio = ratioStr(sortValue(a, refMetric), best)
     var o = "{\"n\": \(s.count), \"fail\": \(a.fails), \"err\": \(a.rcodeErrs), \"timeouts\": \(a.timeouts), "
-    o += "\"net_errors\": \(a.netErrs), \"rcodes\": {\(rcodes.joined(separator: ", "))}, "
+    o += "\"net_errors\": \(a.netErrs), \"closed\": \(a.closes), \"retried\": \(a.retried), "
+    o += "\"rcodes\": {\(rcodes.joined(separator: ", "))}, "
     o += "\"min\": \(v(percentile(s, 0))), \"p50\": \(v(percentile(s, 50))), \"p90\": \(v(percentile(s, 90))), "
     o += "\"p99\": \(v(percentile(s, 99))), \"p999\": \(v(percentile(s, 99.9))), \"max\": \(v(percentile(s, 100))), "
     o += "\"mean\": \(v(mean)), \"std\": \(v(std)), \"vs\": \(ratio == "-" ? "null" : String(ratio.dropLast()))"
@@ -1011,14 +1367,16 @@ func writeJSON(_ path: String, _ cfg: Config, _ names: [String], _ addrs: [Strin
     d += "\"qtype\": \(jsonString(qtypeName(cfg.qtype))), \"order\": \"\(orderName())\", "
     d += "\"family\": \"\(familyOnly == AF_INET ? "v4" : (familyOnly == AF_INET6 ? "v6" : "any"))\", "
     d += "\"spin\": \(spinFlag), \"rt\": \(rtFlag), \"kts\": \(ktsActive), \"pin\": \(pin), "
-    d += "\"vs_metric\": \"\(metricName(refMetric))\"},\n"
+    d += "\"tcp\": \(tcpFlag), \"reconnect\": \(reconnectFlag), \"vs_metric\": \"\(metricName(refMetric))\"},\n"
     d += "  \"hit_domains\": [" + cfg.hitDomains.map {
         "{\"name\": \(jsonString($0.name)), \"qtype\": \(jsonString(qtypeName($0.qtype ?? cfg.qtype)))}"
     }.joined(separator: ", ") + "],\n"
     d += "  \"miss_base\": \(jsonString(cfg.missBase)),\n"
     d += "  \"clock\": {\"cost_ns\": \(clkCost), \"resolution_ns\": \(clkRes)},\n  \"resolvers\": [\n"
     for i in names.indices {
-        d += "    {\"name\": \(jsonString(names[i])), \"address\": \(jsonString(addrs[i])), \"family\": \"\(isV6[i] ? "v6" : "v4")\""
+        d += "    {\"name\": \(jsonString(names[i])), \"address\": \(jsonString(addrs[i])), \"family\": \"\(isV6[i] ? "v6" : "v4")\", "
+        d += "\"transport\": \"\(isStream[i] ? "tcp" : "udp")\", \"port\": \(ports[i])"
+        if isStream[i] { d += ", \"reconnects\": \(reconns[i])" }
         if doHit { d += ",\n     \"hit\": " + jsonPhase(hit[i], hBest, refMetric, samplesFlag) }
         if doMiss { d += ",\n     \"miss\": " + jsonPhase(miss[i], mBest, refMetric, samplesFlag) }
         d += i == names.count - 1 ? "}\n" : "},\n"
@@ -1067,8 +1425,8 @@ func usage() {
     fputs("""
     usage: dnsbench [-c FILE] [--rounds N] [--qtype A|AAAA|HTTPS|N] [--mode hit|miss|both]
                     [--timeout-ms N] [--gap MS] [--spin] [--edns] [--rt] [--kts] [--pin N]
-                    [--sort KEY] [--html FILE] [--json FILE] [--csv FILE] [--samples]
-                    [--label TEXT] [-v] [-h] [--version]
+                    [--tcp] [--reconnect] [--sort KEY] [--html FILE] [--json FILE]
+                    [--csv FILE] [--samples] [--label TEXT] [-v] [-h] [--version]
       -c, --config FILE      configuration file (default: ./dnsbench.conf)
           --rounds N         override the round count (quick smoke test)
           --qtype T          override the global query type (A, AAAA, HTTPS, TXT or numeric)
@@ -1094,6 +1452,14 @@ func usage() {
           --fixed-order      alias of --order conf (v2.2 behaviour)
       -4, -6                 restrict the panel to IPv4-only / IPv6-only without
                              editing the conf (mutually exclusive)
+          --tcp              query every resolver over TCP without editing the conf
+                             (one entry at a time: tcp://ADDR[:PORT] in [resolvers])
+          --reconnect        TCP entries: a new connection for every query, timed
+                             from connect() - handshake + query. Default: one
+                             persistent connection per resolver, reopened outside
+                             the timed window when the server closes it while
+                             idle. Sequential. Either way, a query whose connection
+                             is closed mid-flight is repeated once, clock running.
           --sort KEY         sort + vs-ratio on min|p50|p90|p99|p999|max|mean
           --html FILE        also write a standalone HTML report (tables + CDF charts)
           --json FILE        also write the whole run as JSON (versioned schema,
@@ -1124,6 +1490,8 @@ var spinFlag = false
 var rtFlag = false
 var ktsFlag = false
 var pinCore: Int? = nil
+var tcpFlag = false
+var reconnectFlag = false
 var verboseFlag = false
 var sortKey: SortKey? = nil
 var htmlPath: String? = nil
@@ -1184,6 +1552,10 @@ while let a = it.next() {
     case "-6":
         if familyOnly == AF_INET { fputs("dnsbench: -4 and -6 are mutually exclusive\n", stderr); exit(2) }
         familyOnly = AF_INET6
+    case "--tcp":
+        tcpFlag = true
+    case "--reconnect":
+        reconnectFlag = true
     case "-v", "--verbose":
         verboseFlag = true
     case "--sort":
@@ -1238,6 +1610,15 @@ if spinFlag && cfg.parallel {
     fputs("dnsbench: --spin implies sequential mode, disabling parallel\n", stderr)
     cfg.parallel = false
 }
+// Cold streams connect inside the timed window: that takes the sequential loop.
+let wantsStreams = tcpFlag || cfg.resolvers.contains { parseTarget($0.ip)?.transport == .tcp }
+if reconnectFlag && !wantsStreams {
+    fputs("dnsbench: --reconnect only applies to tcp entries (none in this panel), ignored\n", stderr)
+}
+if reconnectFlag && wantsStreams && cfg.parallel {
+    fputs("dnsbench: --reconnect implies sequential mode, disabling parallel\n", stderr)
+    cfg.parallel = false
+}
 if rtFlag { applyRuntimeHints() }
 if let core = pinCore {
 #if canImport(Darwin)
@@ -1270,20 +1651,42 @@ let recvCap = 2048                                     // > EDNS0 bufsize 1232
 var recvBuf = [UInt8](repeating: 0, count: recvCap)
 
 var fds = [Int32](); var names = [String](); var isV6 = [Bool]()
-var addrs = [String]()                                 // as written in the conf (JSON output)
+var addrs = [String]()                                 // address literal from the conf (JSON output)
+// Transport state, per entry. Stream entries keep their address: they reconnect.
+var isStream = [Bool](); var ports = [UInt16]()
+var sas = [sockaddr_storage](); var salens = [socklen_t](); var fams = [Int32]()
+var reconns = [Int]()                                  // warm streams found closed while idle, reopened before t0
 var skippedFamily = 0
 for r in cfg.resolvers {
-    guard let (ss, len, fam) = resolveSockaddr(r.ip, 53) else {
+    guard let tgt = parseTarget(r.ip) else {
+        fputs("warning: skipping \(r.name): invalid address or unsupported transport (\(r.ip))\n", stderr); continue
+    }
+    let stream = tcpFlag || tgt.transport == .tcp
+    guard let (ss, len, fam) = resolveSockaddr(tgt.host, tgt.port) else {
         fputs("warning: skipping invalid address: \(r.name) (\(r.ip))\n", stderr); continue
     }
     if let only = familyOnly, fam != only { skippedFamily += 1; continue }
     var mss = ss
-    let fd = openConnectedSocket(addr: &mss, addrlen: len, family: fam,
+    var fd: Int32 = -1
+    if stream {
+        // Warm streams connect now, untimed (cold ones connect once per query).
+        // A server that refuses or filters TCP stays in the panel: every visit
+        // retries, and its row reports the failures.
+        if !reconnectFlag {
+            fd = openStream(addr: &mss, addrlen: len, family: fam, timeoutMs: cfg.timeoutMs,
+                            nonblocking: cfg.parallel || spinFlag, busyPoll: rtFlag).fd
+            if fd < 0 {
+                fputs("warning: cannot connect to \(r.name) (\(r.ip)) over tcp - kept in the panel, retried at every visit\n", stderr)
+            }
+        }
+    } else {
+        fd = openConnectedSocket(addr: &mss, addrlen: len, family: fam,
                                  timeoutMs: cfg.timeoutMs, nonblocking: cfg.parallel || spinFlag)
-    if fd < 0 {
-        fputs("warning: cannot open/connect socket for \(r.name) (\(r.ip)), skipping\n", stderr); continue
+        if fd < 0 {
+            fputs("warning: cannot open/connect socket for \(r.name) (\(r.ip)), skipping\n", stderr); continue
+        }
     }
-    if ktsFlag {
+    if ktsFlag && !stream {
         var one: Int32 = 1
 #if canImport(Darwin)
         let tsrc = setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &one, socklen_t(MemoryLayout<Int32>.size))
@@ -1296,7 +1699,7 @@ for r in cfg.resolvers {
         }
     }
 #if !canImport(Darwin)
-    if rtFlag {
+    if rtFlag && !stream {
         var us: Int32 = 50
         if setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &us, socklen_t(MemoryLayout<Int32>.size)) != 0 && !busyPollWarned {
             busyPollWarned = true
@@ -1304,17 +1707,21 @@ for r in cfg.resolvers {
         }
     }
 #endif
-    fds.append(fd); names.append(r.name); addrs.append(r.ip); isV6.append(fam == AF_INET6)
+    fds.append(fd); names.append(r.name); addrs.append(tgt.host); isV6.append(fam == AF_INET6)
+    isStream.append(stream); ports.append(tgt.port); sas.append(ss); salens.append(len); fams.append(fam)
+    reconns.append(0)
+    streamBuf.append(stream ? [UInt8](repeating: 0, count: streamCap) : []); streamHave.append(0)
     if verboseFlag {
         var dbgSS = ss
         var dbgHost = [CChar](repeating: 0, count: 64)
         let gi = withUnsafePointer(to: &dbgSS) { p in p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sap in
             getnameinfo(sap, len, &dbgHost, socklen_t(64), nil, 0, NI_NUMERICHOST) } }
         let parsed = gi == 0 ? String(cString: dbgHost) : "ERR(\(gi))"
-        fputs("resolver '\(r.name)': conf=[\(r.ip)] -> \(fam == AF_INET6 ? "v6" : "v4") parsed=[\(parsed)]:53\n", stderr)
+        fputs("resolver '\(r.name)': conf=[\(r.ip)] -> \(fam == AF_INET6 ? "v6" : "v4") parsed=[\(parsed)]:\(tgt.port)\(stream ? " tcp" : "")\n", stderr)
     }
 }
 if fds.isEmpty { fputs("dnsbench: no usable resolvers.\n", stderr); exit(1) }
+let anyStream = isStream.contains(true)
 if let only = familyOnly, skippedFamily > 0 {
     fputs("family: \(only == AF_INET ? "IPv4" : "IPv6") only - \(skippedFamily) entries skipped\n", stderr)
 }
@@ -1329,6 +1736,69 @@ if ktsActive {
 #else
     fputs("kts: kernel RX timestamps on (CLOCK_REALTIME domain - NTP slew <= 0.5 us/ms, avoid clock steps mid-run)\n", stderr)
 #endif
+    if anyStream { fputs("kts: datagram entries only - tcp samples take t1 in user space (do not compare them to kts rows at the us level)\n", stderr) }
+}
+
+// Stream entries: connection upkeep, and one query (see "Stream transport").
+// Bring entry i to a usable connection, outside any timed window. nil = ready;
+// otherwise the outcome to record for the query that could not be sent.
+func ensureStream(_ i: Int) -> Probe? {
+    if fds[i] >= 0 && streamStale(fds[i]) { close(fds[i]); fds[i] = -1; reconns[i] += 1 }
+    if fds[i] >= 0 { return nil }
+    let (fd, res) = openStream(addr: &sas[i], addrlen: salens[i], family: fams[i], timeoutMs: cfg.timeoutMs,
+                               nonblocking: cfg.parallel || spinFlag, busyPoll: rtFlag)
+    if fd < 0 { return res == .timeout ? .timeout : .netErr }
+    fds[i] = fd; streamHave[i] = 0
+    return nil
+}
+
+// One query on stream entry i, the way a client lives it. An attempt either
+// rides the persistent connection (warm, first attempt) or dials inside the
+// timed window (cold mode, and any retry). When the server closes or resets
+// the connection with the query in flight, the query is repeated once on a
+// new connection: t0 and the timeout budget are those of the first attempt.
+func streamQuery(_ i: Int, _ query: [UInt8], _ id: UInt16, spin: Bool,
+                 wantTTL: Bool) -> (probe: Probe, ttl: UInt32?, retried: Bool) {
+    var t0: UInt64? = nil
+    var retried = false
+    while true {
+        let dial = reconnectFlag || retried
+        var fd: Int32
+        if dial {
+            fd = makeStreamSocket(family: fams[i], busyPoll: rtFlag)
+            if fd < 0 { return (.netErr, nil, retried) }
+            streamHave[i] = 0
+            let opened = t0 ?? probeNow()
+            t0 = opened
+            let c = connectStream(fd, &sas[i], salens[i], deadline: opened &+ UInt64(cfg.timeoutMs) &* 1_000_000, spin: spin)
+            if c != .ok { close(fd); return (c == .timeout ? .timeout : .netErr, nil, retried) }
+        } else {
+            if let failed = ensureStream(i) { return (failed, nil, false) }
+            fd = fds[i]
+        }
+        let r = streamExchange(fd: fd, query: query, expectId: id, t0: t0, timeoutMs: cfg.timeoutMs,
+                               nonblock: dial || cfg.parallel || spinFlag, spin: spin, wantTTL: wantTTL,
+                               buf: &streamBuf[i], have: &streamHave[i])
+        t0 = r.t0
+        if reconnectFlag {
+            close(fd)                                  // cold: one connection per attempt
+        } else if !r.alive {
+            close(fd); fds[i] = -1
+        } else if dial {                               // warm: the retry's connection carries on
+            settleStream(fd, timeoutMs: cfg.timeoutMs, nonblocking: cfg.parallel || spinFlag)
+            fds[i] = fd
+        }
+        if case .closed = r.probe, !retried { retried = true; continue }
+        return (r.probe, r.ttl, retried)
+    }
+}
+
+// A stream sample and its bookkeeping: a repeated query is counted, whatever
+// its outcome.
+func streamSample(_ acc: inout [Acc], _ i: Int, _ query: [UInt8], _ id: UInt16) {
+    let r = streamQuery(i, query, id, spin: spinFlag, wantTTL: false)
+    if r.retried { acc[i].retried += 1 }
+    record(&acc, i, r.probe)
 }
 
 // Query templates: built once, TXID (and MISS label) patched in place per send.
@@ -1342,7 +1812,7 @@ var rng = XorShift64(seed: monotonicNanos() ^ (UInt64(bitPattern: Int64(getpid()
 let (clkCost, clkRes) = clockCalibration()
 let doHit = cfg.mode != .miss, doMiss = cfg.mode != .hit
 let startedStamp = utcStamp()
-print("dnsbench v\(VERSION) - \(fds.count) resolvers, \(cfg.rounds) rounds/mode, mode=\(cfg.mode == .both ? "both" : (cfg.mode == .hit ? "hit" : "miss"))\(cfg.parallel ? " (parallel)" : "")\(spinFlag ? " (spin)" : "")\(cfg.edns ? " (edns)" : "")\(ktsActive ? " (kts)" : "")\(orderMark())\(familyOnly == AF_INET ? " (v4 only)" : (familyOnly == AF_INET6 ? " (v6 only)" : "")), "
+print("dnsbench v\(VERSION) - \(fds.count) resolvers, \(cfg.rounds) rounds/mode, mode=\(cfg.mode == .both ? "both" : (cfg.mode == .hit ? "hit" : "miss"))\(cfg.parallel ? " (parallel)" : "")\(spinFlag ? " (spin)" : "")\(cfg.edns ? " (edns)" : "")\(ktsActive ? " (kts)" : "")\(tcpFlag ? " (tcp)" : "")\(reconnectFlag && anyStream ? " (reconnect)" : "")\(orderMark())\(familyOnly == AF_INET ? " (v4 only)" : (familyOnly == AF_INET6 ? " (v6 only)" : "")), "
     + "timeout \(cfg.timeoutMs) ms\(cfg.gapMs > 0 ? ", gap \(cfg.gapMs) ms" : ""), \(cfg.hitDomains.count) hit domain(s), default qtype=\(qtypeName(cfg.qtype)), vs/sort=\(metricName(refMetric))")
 print("clock: ~\(clkCost) ns/call, resolution \(clkRes) ns")
 print("MISS=<rand>.\(cfg.missBase)\n")
@@ -1355,7 +1825,10 @@ if doHit {
         for d in cfg.hitDomains.indices {
             let id = rng.nextId()
             patchId(&hitTemplates[d], id)
-            if let ttl = warmupProbe(fd: fds[i], query: hitTemplates[d], expectId: id, timeoutMs: cfg.timeoutMs, recvBuf: &recvBuf) {
+            let ttl = isStream[i]
+                ? streamQuery(i, hitTemplates[d], id, spin: false, wantTTL: true).ttl
+                : warmupProbe(fd: fds[i], query: hitTemplates[d], expectId: id, timeoutMs: cfg.timeoutMs, recvBuf: &recvBuf)
+            if let ttl = ttl {
                 if domainTTL[d] == nil || ttl < domainTTL[d]! { domainTTL[d] = ttl }
             }
         }
@@ -1396,6 +1869,7 @@ var parT0 = [UInt64](repeating: 0, count: N)
 var parPfds = [pollfd](repeating: pollfd(), count: N)
 var parOrder = [Int](repeating: 0, count: N)
 var parResults = [Probe?](repeating: nil, count: N)
+var parStage = [UInt8](repeating: 0, count: N)      // streams: non-zero = query repeated after a close
 var seqOrder = baseOrder            // sequential visit order, reshuffled per round in shuffle mode
 
 func record(_ acc: inout [Acc], _ i: Int, _ p: Probe) {
@@ -1404,24 +1878,35 @@ func record(_ acc: inout [Acc], _ i: Int, _ p: Probe) {
     case .rcode(_, let rc): acc[i].rcodeCounts[Int(rc)] += 1
     case .timeout:          acc[i].timeouts += 1
     case .netErr:           acc[i].netErrs += 1
+    case .closed:           acc[i].closes += 1
     }
 }
 
 for round in 0..<cfg.rounds {
     let dIdx = round % cfg.hitDomains.count
     if cfg.parallel {
+        // Streams the server closed since the last phase are reopened here,
+        // before any t0 - never inside the fan-out.
         if doHit {
-            fanPhase(fds: fds, template: &hitTemplates[dIdx], labelOffset: nil,
+            if anyStream { for i in 0..<N where isStream[i] { _ = ensureStream(i) } }
+            fanPhase(fds: &fds, streams: isStream, stage: &parStage, template: &hitTemplates[dIdx], labelOffset: nil,
                      rng: &rng, timeoutMs: cfg.timeoutMs, recvBuf: &recvBuf,
                      ids: &parIds, t0: &parT0, pfds: &parPfds, order: &parOrder, results: &parResults)
-            for i in 0..<N { record(&hit, i, parResults[i] ?? .timeout); done += 1 }
+            for i in 0..<N {
+                if parStage[i] != 0 { hit[i].retried += 1 }
+                record(&hit, i, parResults[i] ?? .timeout); done += 1
+            }
             if cfg.gapMs > 0 { sleepMs(cfg.gapMs) }
         }
         if doMiss {
-            fanPhase(fds: fds, template: &missTemplate, labelOffset: missLabelOffset,
+            if anyStream { for i in 0..<N where isStream[i] { _ = ensureStream(i) } }
+            fanPhase(fds: &fds, streams: isStream, stage: &parStage, template: &missTemplate, labelOffset: missLabelOffset,
                      rng: &rng, timeoutMs: cfg.timeoutMs, recvBuf: &recvBuf,
                      ids: &parIds, t0: &parT0, pfds: &parPfds, order: &parOrder, results: &parResults)
-            for i in 0..<N { record(&miss, i, parResults[i] ?? .timeout); done += 1 }
+            for i in 0..<N {
+                if parStage[i] != 0 { miss[i].retried += 1 }
+                record(&miss, i, parResults[i] ?? .timeout); done += 1
+            }
             if cfg.gapMs > 0 { sleepMs(cfg.gapMs) }
         }
         let now = monotonicNanos()
@@ -1438,8 +1923,12 @@ for round in 0..<cfg.rounds {
             if doHit {
                 let id1 = rng.nextId()
                 patchId(&hitTemplates[dIdx], id1)
-                record(&hit, i, measureOnce(fd: fds[i], query: hitTemplates[dIdx], expectId: id1,
-                                            timeoutMs: cfg.timeoutMs, spin: spinFlag, recvBuf: &recvBuf))
+                if isStream[i] {
+                    streamSample(&hit, i, hitTemplates[dIdx], id1)
+                } else {
+                    record(&hit, i, measureOnce(fd: fds[i], query: hitTemplates[dIdx], expectId: id1,
+                                                timeoutMs: cfg.timeoutMs, spin: spinFlag, recvBuf: &recvBuf))
+                }
                 done += 1
                 if cfg.gapMs > 0 { sleepMs(cfg.gapMs) }
             }
@@ -1447,8 +1936,12 @@ for round in 0..<cfg.rounds {
                 let id2 = rng.nextId()
                 patchId(&missTemplate, id2)
                 patchLabel(&missTemplate, missLabelOffset, &rng)
-                record(&miss, i, measureOnce(fd: fds[i], query: missTemplate, expectId: id2,
-                                             timeoutMs: cfg.timeoutMs, spin: spinFlag, recvBuf: &recvBuf))
+                if isStream[i] {
+                    streamSample(&miss, i, missTemplate, id2)
+                } else {
+                    record(&miss, i, measureOnce(fd: fds[i], query: missTemplate, expectId: id2,
+                                                 timeoutMs: cfg.timeoutMs, spin: spinFlag, recvBuf: &recvBuf))
+                }
                 done += 1
                 if cfg.gapMs > 0 { sleepMs(cfg.gapMs) }
             }
@@ -1481,6 +1974,19 @@ if anomalyLines.isEmpty {
     for l in anomalyLines { print(l) }
     if hit.contains(where: { $0.rcodeCounts[5] > 0 }) || miss.contains(where: { $0.rcodeCounts[5] > 0 }) {
         print("note: REFUSED from a Pi-hole is typically FTL rate limiting (default 1000 q / 60 s per client) - consider --gap")
+    }
+}
+// What the servers did to the streams - none of it excluded from the samples.
+// Closed while idle: reopened before t0, the next sample rode a new
+// connection. Closed with a query in flight: the query was repeated, and its
+// sample spans the lost attempt, the handshake and the answer.
+for i in fds.indices {
+    if reconns[i] > 0 {
+        print("note: \(names[i]): tcp connection closed by the server while idle, \(reconns[i]) time(s) - reopened before t0, outside the samples")
+    }
+    let repeated = (doHit ? hit[i].retried : 0) + (doMiss ? miss[i].retried : 0)
+    if repeated > 0 {
+        print("note: \(names[i]): tcp connection closed by the server mid-query, \(repeated) time(s) - query repeated on a new connection; those samples include the lost attempt and the handshake")
     }
 }
 

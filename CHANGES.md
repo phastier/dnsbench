@@ -134,6 +134,123 @@ so `dnsbench --json - | jq` is a clean pipe (one of `--json` / `--csv`
 at a time). Hand-written serializers, no Foundation. Pure output: the
 measurement paths are those of 2.3.
 
+## v2.5 — DNS over TCP
+
+A `[resolvers]` address can now carry a scheme: `tcp://ADDR[:PORT]`
+selects TCP, `udp://ADDR[:PORT]` is UDP with a port (IPv6 literals in
+brackets). A bare address stays what it always was — UDP, port 53. Any
+other scheme is refused with a warning rather than probed over UDP.
+`--tcp` runs a whole panel over TCP without editing the configuration.
+Listing a server as both `ADDR` and `tcp://ADDR` puts its two transports
+in the same rotation.
+
+**Two samples, because a client can experience two things.** *Warm*
+(default): one persistent connection per resolver (RFC 7766), the sample
+is send → complete reply — the same window as UDP. *Cold*
+(`--reconnect`): a new connection per query, `t0` taken before
+`connect()` — handshake plus query, what a stub falling back from a
+truncated UDP answer pays. Cold forces sequential mode, with a message,
+like `--spin`.
+
+**The path.** One `sendmsg()` carries the two-byte length prefix and the
+shared datagram template (two iovecs, one segment, `TCP_NODELAY`): no
+second template set, and the hot path still allocates nothing. Replies
+are reassembled across segments in a per-resolver buffer sized for the
+largest DNS message. Blocking sockets keep the UDP happy path — one
+send, one recv under `SO_RCVTIMEO`, re-armed only when a reply arrives
+in pieces; `--spin` busy-waits on a non-blocking socket as on UDP;
+`--parallel` reassembles on `POLLIN`. `connect()` is non-blocking and
+bounded by the configured timeout: a filtered port costs the timeout,
+not the OS default. No SIGPIPE (`SO_NOSIGPIPE` on Darwin, `MSG_NOSIGNAL`
+on Linux).
+
+**Server-side closes.** A server may close a connection whenever it
+likes, and a client can live two different things. *Idle close*: before
+every `t0`, a non-blocking peek tells whether the server closed; the
+connection is then reopened *outside* the timed window and counted (JSON
+`reconnects`) — the sample is kept, it simply rode a new connection.
+*Close with the query in flight*: the peek cannot be airtight (a close
+can cross the query on the wire, and some servers close on receipt), so
+the probe does what RFC 7766 §6.2.4 asks of a client — it connects again
+and repeats the query, once, inside the same timed window and the same
+timeout budget. That sample spans the lost attempt, the handshake and
+the answer; the query is counted `retried` (JSON, per phase). Only a
+second close on the same query is a `fail`, of a new kind next to
+timeouts and network errors: `closed`. Each kind of event gets its
+console note and its HTML note, per resolver. In parallel mode the retry
+is a small state machine inside the fan-out — non-blocking redial, the
+query again on writability — so that no handshake ever blocks the batch;
+a repeated MISS query carries a fresh random label. A server that
+refuses or filters TCP stays in the panel and fails every round — the
+connectivity check the tables already gave for UDP.
+
+**Late replies.** A reply landing after its timeout stays in the stream;
+the next exchange drops every complete message that does not answer the
+current query, including one the timeout cut in half — the stream
+equivalent of the datagram drain, with the same guarantee: no cascade.
+
+**Accuracy planes.** `--spin` and `--rt` apply. `--kts` does not: kernel
+RX timestamps are enabled on datagram sockets only, TCP samples take
+`t1` in user space, and a note says so when both are present — do not
+compare a `--kts` UDP row with a TCP row at the microsecond level.
+
+**Datagram path.** `measureOnce`, `recvWithTS` and the warm-up probe are
+untouched; in sequential mode the transport is chosen before `t0`. In
+parallel mode the fan-out tests the entry's transport once before `t0`
+and once per ready descriptor.
+
+**Output.** The JSON gains `transport` and `port` on every resolver,
+`reconnects` on TCP ones, `closed` and `retried` in each phase, `tcp`
+and `reconnect` among the options. Additions only: the schema number
+stays 1, 2.4 having never been published on its own. The console and
+HTML anomaly lines gain `closed`; the CSV columns do not change (`fail`
+includes it).
+
+**Configuration file.** The example file shipped with 2.3 placed
+`miss_base` after `[hit_domains]`. A section ran to the next one
+whatever it held, so that line was read as a hit domain named
+`miss_base` — queried one round in three — and the MISS base silently
+kept its default, which happened to be the example's own value. The
+example now keeps every setting above the first section, and the parser
+reads a known setting as a setting wherever it sits, with a message
+asking to move it. If your configuration was copied from the 2.3
+example, its `miss_base` only takes effect from this version on.
+
+Validation: a loopback mock server with one failure mode per port
+(reply in three segments, close after every reply, close without
+answering every fifth query, close on every query, close on every other
+connection, reply after the timeout, half a reply then the rest after
+the timeout, a stale message before every reply, a 4.8 kB answer,
+REFUSED, no listener), in sequential, `--spin`, `--parallel` and
+`--reconnect` modes, on macOS and on Linux amd64 (static musl build):
+the probe's counters — samples, repeated queries, reopened connections,
+`closed` — match the server's connection and query counts exactly.
+Datagram path against 2.3, same Linux node, same panel, reference plane,
+ABAB: p50 differences on the fast LAN resolvers between −24 and +10 µs,
+inside the spread between repetitions (100–150 rounds: a smoke test, not
+a campaign).
+
+First campaign on real resolvers, same Linux node: five LAN resolvers,
+each over UDP and over TCP, IPv4 then IPv6, warm then cold, 5000 rounds
+per mode with `--rt --spin --pin` — 400 000 queries, every run exit 0.
+Two of the resolvers close a TCP connection after 100 queries: 100
+closes per TCP entry and per warm run over 10 003 queries, 85 to 94
+found idle and reopened before `t0`, 6 to 15 with the query in flight
+and repeated, no `closed` failure. The only failures of the campaign
+(15, UDP and TCP alike) fall in the four seconds during which one
+resolver's service was restarted by hand; they are reported as timeouts
+and network errors. The cold figures were cross-checked with an
+independent socket client timing `connect()` and the query separately.
+The results are under *Transport* in the README.
+
+The arm64 build is compiled but **not yet run**; the glibc build is not
+yet compiled.
+
+**Build.** `make macos-arm64` builds the macOS release asset with a
+pinned deployment target (`MACOS_TARGET`, macOS 26.0 by default). A
+plain `make` targets the build host's OS version: fine for a local
+build, wrong for a binary meant to run elsewhere.
+
 ## Measurement validity
 
 **Late-reply drain (the v1 cascade bug).** In sequential mode, a reply
@@ -255,9 +372,15 @@ binaries (v1 arm64 already produced, v2 via `make linux-arm64`).
 
 ## Deferred (v2.x)
 
-A Prometheus textfile collector (`--json` and `--csv` landed in 2.4); `--bind`.
-DoT/DoH: non-goal (zero dependencies). Deliberately set aside: io_uring
-SQPOLL (a Linux-only architecture change for 1–2 µs already below the
-`--kts` floor), TX timestamps (`MSG_ERRQUEUE`, disproportionate
-complexity for ~1 µs on the send side), `PR_SET_TIMERSLACK` (`prctl` is
-variadic in C, uncallable from Swift).
+A Prometheus textfile collector (`--json` and `--csv` landed in 2.4);
+`--bind`; kernel RX timestamps on stream sockets (untested on either OS).
+DoT and DoH: planned, on both OS families — the stream transport of 2.5
+is their substrate. They were a non-goal for as long as "zero
+dependencies" was absolute; they need a TLS stack, and the rule becomes:
+nothing beyond one reference TLS implementation (Apple's or OpenSSL).
+
+Deliberately set aside: io_uring SQPOLL (a Linux-only architecture
+change for 1–2 µs already below the `--kts` floor), TX timestamps
+(`MSG_ERRQUEUE`, disproportionate complexity for ~1 µs on the send
+side), `PR_SET_TIMERSLACK` (`prctl` is variadic in C, uncallable from
+Swift).
