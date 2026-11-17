@@ -243,13 +243,59 @@ and network errors. The cold figures were cross-checked with an
 independent socket client timing `connect()` and the query separately.
 The results are under *Transport* in the README.
 
-The arm64 build is compiled but **not yet run**; the glibc build is not
-yet compiled.
+The arm64 build had not been run when 2.5.0 was tagged; it has been
+since (see 2.5.1). The glibc build is not yet compiled.
 
 **Build.** `make macos-arm64` builds the macOS release asset with a
 pinned deployment target (`MACOS_TARGET`, macOS 26.0 by default). A
 plain `make` targets the build host's OS version: fine for a local
 build, wrong for a binary meant to run elsewhere.
+
+## v2.5.1 — HTML report: colours, axis
+
+Two defects of the report, both found on the first panels larger than
+the ones it was drawn for.
+
+**Colours.** The CDF took its colours from a list of twelve, in ranking
+order. With sixteen entries four colours appeared twice, and since the
+HIT and MISS rankings differ, a resolver changed colour between the two
+charts of one report. A colour is now a server: entries whose names
+differ only by a `-v6`, `-v4`, `-tcp` or `-udp` suffix share it, in
+configuration order, identically in both charts. The line style carries
+the variant — v4 solid, v6 dashed, and where a panel mixes transports,
+TCP dotted (v6 over TCP dash-dot); two entries of one server that would
+share both get separate colours. The palette is eight hues from the
+earlier twelve, the subset and the order chosen by computation rather
+than by eye: the eight that stay furthest apart pairwise, ordered so
+that neighbours remain distinct under protanopia and deuteranopia (OKLab
+distance at least 11 between neighbours, 20 for full colour vision), all
+at 3:1 or better against the chart surface. Past eight servers a hue
+would have to be reused: the panel is split into several charts on the
+same axes instead, eight servers each, in configuration order. Each
+curve has a hover target that names it with its p50 and p99; the legend
+swatches show the line style.
+
+**X axis.** The marks came from a fixed 1-2-5 list. A cache-MISS panel
+spanning 11 to 27 ms had exactly one of them ("20"), and nothing past
+200 ms. The series is now generated for the range; when fewer than four
+of its marks fall inside, evenly spaced round values take over (12, 14,
+… 26 in that case), and a mark whose label would touch the previous one
+is dropped.
+
+Measurement paths, console, JSON and CSV are those of 2.5.
+
+Validation: reports rendered and read for a 16-entry panel (8 servers,
+both families), a 20-entry one (5 servers, both families, both
+transports), a single-transport TCP panel, and an 11-server panel (two
+charts). The tick generator was checked on thirteen ranges from 0.05 ms
+to 1 s.
+
+**arm64.** The static arm64 build of 2.5.0 was run on an aarch64 Linux
+node: the mock suite of the 2.5 validation (six runs) gives the same
+counters as on amd64 in all 133 resolver-and-phase comparisons, the
+mock server counts the same queries on every port, and the real panel
+answers over UDP with `--kts`, over TCP warm, cold and in parallel —
+every run exit 0, no failure.
 
 ## Measurement validity
 

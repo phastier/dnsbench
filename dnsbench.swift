@@ -33,6 +33,9 @@
 //   - v2.5: DNS over TCP - tcp://ADDR[:PORT] entries or --tcp for the whole
 //     panel; persistent connections (warm) or --reconnect (handshake + query);
 //     udp:// and tcp:// entries accept a port
+//   - v2.5.1: HTML report - one colour per server (stable between the HIT
+//     and MISS charts), line style per family/transport, several charts
+//     beyond eight servers, X ticks that follow the range
 //
 // Build: see Makefile (swiftc -O dnsbench.swift -o dnsbench).
 // Usage: ./dnsbench [-c FILE] [--rounds N] [--qtype A|AAAA|HTTPS|N] [--mode hit|miss|both]
@@ -56,7 +59,7 @@ let SOCK_STREAM_VAL = Int32(SOCK_STREAM.rawValue)
 let SEND_FLAGS = Int32(MSG_NOSIGNAL)
 #endif
 
-let VERSION = "2.5"
+let VERSION = "2.5.1"
 
 // ───────────────────────────── Monotonic clock ─────────────────────────────
 @inline(__always)
@@ -1108,8 +1111,85 @@ func he(_ s: String) -> String {
 }
 func n1(_ v: Double) -> String { let r = (v * 10).rounded() / 10; return "\(r)" }
 
-let palette = ["#4f46e5", "#dc2626", "#059669", "#d97706", "#0891b2", "#7c3aed",
-               "#db2777", "#65a30d", "#2563eb", "#ea580c", "#0d9488", "#9333ea"]
+// Fixed-point label without Foundation: fixed(12.5, 1) = "12.5" (v >= 0).
+func fixed(_ v: Double, _ decimals: Int) -> String {
+    var scale = 1; for _ in 0..<decimals { scale *= 10 }
+    let n = Int((v * Double(scale)).rounded())
+    if decimals == 0 { return "\(n)" }
+    let frac = "\(n % scale)"
+    return "\(n / scale)." + String(repeating: "0", count: decimals - frac.count) + frac
+}
+
+// Chart colours: eight hues in a fixed order, checked as a set on the white
+// chart surface (lightness, chroma, contrast >= 3:1, and neighbours that stay
+// apart under protanopia and deuteranopia). A colour is a server, not a rank:
+// it is the same in the HIT and the MISS chart, and entries whose names differ
+// only by a family or transport suffix share it - the line style tells them
+// apart. Eight is the limit of what stays distinguishable: more servers go to
+// a second chart on the same axes rather than to a ninth hue.
+let palette = ["#2563eb", "#059669", "#9333ea", "#d97706", "#db2777", "#65a30d", "#0891b2", "#dc2626"]
+let seriesSuffixes = ["-v6", "-v4", "-tcp", "-udp"]
+
+// "ns1-v6-tcp" -> "ns1".
+func seriesStem(_ name: String) -> String {
+    var s = Substring(name.lowercased())
+    var cut = true
+    while cut {
+        cut = false
+        for suf in seriesSuffixes where s.count > suf.count && s.hasSuffix(suf) { s = s.dropLast(suf.count); cut = true }
+    }
+    return String(s)
+}
+
+// Colour slot of every entry, in configuration order. Two entries of one
+// server that would also share a line style (same family, same transport)
+// get separate slots.
+func seriesSlots(_ names: [String], _ isV6: [Bool]) -> (slot: [Int], count: Int) {
+    var slotOf: [String: Int] = [:]
+    var taken = Set<Int>()
+    var slot = [Int](repeating: 0, count: names.count)
+    for i in names.indices {
+        let variant = (isStream[i] ? 2 : 0) + (isV6[i] ? 1 : 0)
+        var key = seriesStem(names[i])
+        while let s = slotOf[key], taken.contains(s * 4 + variant) { key += "+" }
+        let s = slotOf[key] ?? slotOf.count
+        slotOf[key] = s; taken.insert(s * 4 + variant); slot[i] = s
+    }
+    return (slot, slotOf.count)
+}
+
+// v4 solid, v6 dashed. In a panel that mixes transports, TCP is dotted and v6
+// over TCP dash-dot; a panel that is all TCP keeps the plain styles.
+func seriesDash(_ v6: Bool, _ dotted: Bool) -> String {
+    let d = dotted ? (v6 ? "7 3 2 3" : "2 3") : (v6 ? "5 3" : "")
+    return d.isEmpty ? "" : " stroke-dasharray=\"\(d)\""
+}
+
+// X ticks of the log axis: the 1-2-5 series when at least four of its marks
+// fall inside the range, otherwise evenly spaced round values - a MISS panel
+// spanning 11 to 27 ms holds a single mark of the series ("20").
+func cdfTicks(_ lo: Double, _ hi: Double) -> [(v: Double, label: String)] {
+    func p10(_ e: Int) -> Double { var x = 1.0; for _ in 0..<abs(e) { x *= 10 }; return e < 0 ? 1 / x : x }
+    var t: [(v: Double, label: String)] = []
+    var e = Int(log10(lo).rounded(.down)) - 1
+    while p10(e) <= hi {
+        for m in [1.0, 2.0, 5.0] {
+            let v = e < 0 ? m / p10(-e) : m * p10(e)
+            if v >= lo && v <= hi { t.append((v, fixed(v, max(0, -e)))) }
+        }
+        e += 1
+    }
+    if t.count >= 4 { return t }
+    t.removeAll()
+    let raw = (hi - lo) / 6                                 // about six intervals
+    e = Int(log10(raw).rounded(.down))
+    let f = raw / p10(e)
+    let step = p10(e) * (f < 1.5 ? 1 : (f < 3.5 ? 2 : (f < 7.5 ? 5 : 10)))
+    if f >= 7.5 { e += 1 }
+    var k = (lo / step).rounded(.up)
+    while k * step <= hi + step * 1e-9 { t.append((k * step, fixed(k * step, max(0, -e)))); k += 1 }
+    return t
+}
 
 func htmlTable(_ title: String, _ accs: [Acc], _ names: [String], _ ord: [Int], _ refMetric: SortKey) -> String {
     let best = bestValue(accs, refMetric)
@@ -1138,7 +1218,8 @@ func htmlTable(_ title: String, _ accs: [Acc], _ names: [String], _ ord: [Int], 
 
 func log10safe(_ x: Double) -> Double { x > 0 ? log10(x) : 0 }
 
-// Overlaid CDFs (one line per resolver), log-X. v4 = solid, v6 = dashed.
+// Overlaid CDFs (one line per resolver), log-X. Colour = server, line style =
+// family and transport; at most palette.count servers per chart.
 func cdfChart(_ accs: [Acc], _ names: [String], _ isV6: [Bool], _ ord: [Int]) -> String {
     var xminNs = UInt64.max, xmaxNs: UInt64 = 0
     for a in accs where !a.samples.isEmpty {
@@ -1155,37 +1236,52 @@ func cdfChart(_ accs: [Acc], _ names: [String], _ isV6: [Bool], _ ord: [Int]) ->
     func xpix(_ ms: Double) -> Double { let c = min(max(ms, xminMs), xmaxMs); return L + (log10safe(c) - logmin) / (logmax - logmin) * plotW }
     func ypix(_ pct: Double) -> Double { T + (1.0 - pct / 100.0) * plotH }
 
-    var svg = "<svg viewBox=\"0 0 \(Int(W)) \(Int(H))\" class=\"chart\" role=\"img\">"
+    // Axes and grid, shared by every chart of the panel.
+    var axes = "<svg viewBox=\"0 0 \(Int(W)) \(Int(H))\" class=\"chart\" role=\"img\">"
     for g in stride(from: 0.0, through: 100.0, by: 25.0) {
         let y = ypix(g)
-        svg += "<line x1=\"\(L)\" y1=\"\(n1(y))\" x2=\"\(L + plotW)\" y2=\"\(n1(y))\" class=\"grid\"/>"
-        svg += "<text x=\"\(L - 5)\" y=\"\(n1(y + 3))\" class=\"ylab\">\(Int(g))%</text>"
+        axes += "<line x1=\"\(L)\" y1=\"\(n1(y))\" x2=\"\(L + plotW)\" y2=\"\(n1(y))\" class=\"grid\"/>"
+        axes += "<text x=\"\(L - 5)\" y=\"\(n1(y + 3))\" class=\"ylab\">\(Int(g))%</text>"
     }
-    let ticks: [Double] = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200]
-    for tk in ticks where tk >= xminMs && tk <= xmaxMs {
-        let x = xpix(tk)
-        svg += "<line x1=\"\(n1(x))\" y1=\"\(T)\" x2=\"\(n1(x))\" y2=\"\(n1(T + plotH))\" class=\"grid\"/>"
-        let lab = tk < 1 ? "\(tk)" : "\(Int(tk))"
-        svg += "<text x=\"\(n1(x))\" y=\"\(n1(T + plotH + 13))\" class=\"xlab\">\(lab)</text>"
+    var lastX = -100.0
+    for tk in cdfTicks(xminMs, xmaxMs) {
+        let x = xpix(tk.v)
+        if x - lastX < 26 { continue }                      // two labels must not touch
+        lastX = x
+        axes += "<line x1=\"\(n1(x))\" y1=\"\(T)\" x2=\"\(n1(x))\" y2=\"\(n1(T + plotH))\" class=\"grid\"/>"
+        axes += "<text x=\"\(n1(x))\" y=\"\(n1(T + plotH + 13))\" class=\"xlab\">\(tk.label)</text>"
     }
-    svg += "<text x=\"\(n1(L + plotW / 2))\" y=\"\(Int(H) - 2)\" class=\"axt\">latency (ms, log scale)</text>"
+    axes += "<text x=\"\(n1(L + plotW / 2))\" y=\"\(Int(H) - 2)\" class=\"axt\">latency (ms, log scale)</text>"
 
-    var legend = "<div class=\"legend\">"
-    var ci = 0
-    for i in ord {
-        let a = accs[i]; if a.samples.isEmpty { continue }
-        var s = a.samples; s.sort()
-        let color = palette[ci % palette.count]; ci += 1
-        let dash = isV6[i] ? " stroke-dasharray=\"5 3\"" : ""
-        var pts = ""; var p = 0.0
-        while p <= 100.0 { pts += "\(n1(xpix(Double(percentile(s, p)) / 1_000_000.0))),\(n1(ypix(p))) "; p += 2.0 }
-        svg += "<polyline points=\"\(pts)\" fill=\"none\" stroke=\"\(color)\" stroke-width=\"1.6\"\(dash)/>"
-        let style = isV6[i] ? "dashed" : "solid"
-        legend += "<span class=\"lg\"><i style=\"border-color:\(color);border-bottom-style:\(style)\"></i>\(he(names[i]))</span>"
+    let (slot, slots) = seriesSlots(names, isV6)
+    let charts = (slots + palette.count - 1) / palette.count
+    let mixed = isStream.contains(true) && isStream.contains(false)
+    var out = ""
+    for c in 0..<charts {
+        var svg = axes
+        var legend = "<div class=\"legend\">"
+        var drawn = 0
+        for i in ord where slot[i] / palette.count == c {
+            let a = accs[i]; if a.samples.isEmpty { continue }
+            var s = a.samples; s.sort()
+            let color = palette[slot[i] % palette.count]
+            let dash = seriesDash(isV6[i], mixed && isStream[i])
+            var pts = ""; var p = 0.0
+            while p <= 100.0 { pts += "\(n1(xpix(Double(percentile(s, p)) / 1_000_000.0))),\(n1(ypix(p))) "; p += 2.0 }
+            // The curve, then a wide transparent copy: a hover target that names it.
+            svg += "<g><title>\(he(names[i])) - p50 \(msStr(percentile(s, 50))) ms, p99 \(msStr(percentile(s, 99))) ms</title>"
+                + "<polyline points=\"\(pts)\" fill=\"none\" stroke=\"\(color)\" stroke-width=\"1.6\"\(dash)/>"
+                + "<polyline points=\"\(pts)\" fill=\"none\" stroke=\"#000\" stroke-opacity=\"0\" stroke-width=\"9\"/></g>"
+            legend += "<span class=\"lg\"><svg width=\"24\" height=\"8\"><line x1=\"1\" y1=\"4\" x2=\"23\" y2=\"4\" stroke=\"\(color)\" stroke-width=\"2\"\(dash)/></svg>\(he(names[i]))</span>"
+            drawn += 1
+        }
+        if drawn == 0 { continue }
+        if charts > 1 {
+            out += "<p class=\"part\">servers \(c * palette.count + 1) to \(min(slots, (c + 1) * palette.count)) of \(slots), in configuration order</p>"
+        }
+        out += svg + "</svg>" + legend + "</div>"
     }
-    svg += "</svg>"
-    legend += "</div>"
-    return svg + legend
+    return out
 }
 
 func writeHTML(_ path: String, _ cfg: Config, _ names: [String], _ isV6: [Bool],
@@ -1206,7 +1302,8 @@ func writeHTML(_ path: String, _ cfg: Config, _ names: [String], _ isV6: [Bool],
     .grid{stroke:#eee;stroke-width:1}.ylab{fill:#999;font-size:10px;text-anchor:end}
     .xlab{fill:#999;font-size:10px;text-anchor:middle}.axt{fill:#888;font-size:11px;text-anchor:middle}
     .legend{display:flex;flex-wrap:wrap;gap:.3rem 1rem;font-size:.74rem;margin:.1rem 0 1rem}
-    .legend i{display:inline-block;width:20px;border-bottom-width:2px;border-bottom-style:solid;margin-right:5px;vertical-align:middle}
+    .legend svg{vertical-align:middle;margin-right:5px}
+    .part{color:#888;font-size:.75rem;margin:.9rem 0 0}
     .foot{color:#888;font-size:.75rem;margin-top:1.4rem}
     td.anom,th.anom{text-align:left}
     """
@@ -1254,8 +1351,9 @@ func writeHTML(_ path: String, _ cfg: Config, _ names: [String], _ isV6: [Bool],
     if !repeated.isEmpty {
         d += "<p class=\"foot\">TCP connections closed by the server mid-query, query repeated on a new connection (those samples include the lost attempt and the handshake): \(repeated.joined(separator: ", ")).</p>"
     }
-    d += "<p class=\"foot\">Values in ms. CDF: a curve further left = faster; v4 solid, v6 dashed; X is log-scaled and "
-    d += "clipped at p99. Bars/vs scale to the fastest on \(metricName(refMetric)). Red rows were unreachable. "
+    d += "<p class=\"foot\">Values in ms. CDF: a curve further left = faster; X is log-scaled and clipped at p99. "
+    d += "One colour per server - entries whose names differ only by a -v6 or -tcp suffix share it; v4 solid, v6 dashed, and where a panel mixes transports TCP dotted (v6 over TCP dash-dot). Hover a curve for its name. "
+    d += "Bars/vs scale to the fastest on \(metricName(refMetric)). Red rows were unreachable. "
     d += "fail counts timeouts, network errors (ICMP unreachable, send failures) and TCP queries whose connection the server closed twice (a first close is retried); err counts replies whose RCODE is neither NOERROR nor NXDOMAIN (SERVFAIL, REFUSED, ...). Both are excluded from the latency samples - hover a fail/err cell for the per-kind breakdown.</p></body></html>"
 
     let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode_t(0o644))

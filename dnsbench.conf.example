@@ -50,6 +50,8 @@ www.wikipedia.org
 #   tcp://9.9.9.9   tcp://[2620:fe::fe]   udp://192.0.2.53:5353   tcp://192.0.2.53:5353
 # List a server under both forms to compare its transports in one run; --tcp
 # switches the whole panel to TCP without editing this file.
+# Names that differ only by a -v4, -v6, -tcp or -udp suffix are one server for
+# the HTML report: one colour, the line style telling family and transport.
 [resolvers]
 9.9.9.9         quad9-v4
 2620:fe::fe     quad9-v6

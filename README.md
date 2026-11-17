@@ -289,9 +289,8 @@ stand without numbers: TCP is what a stub falls back to when a UDP
 answer is truncated, and it is the substrate of DoT and DoH, so measuring
 it alone separates what the transport costs from what encryption adds.
 List a server twice — `ADDR` and `tcp://ADDR` — and both transports ride
-the same rotation, comparable round by round. That doubles the panel and
-the CDF has twelve colours: we ran one report per address family (`-4`,
-`-6`).
+the same rotation, comparable round by round. Name them `NAME` and
+`NAME-tcp`: the HTML report then draws both in one colour, TCP dotted.
 
 The campaign came afterwards: five LAN resolvers, each listed over UDP
 and over TCP, 5000 rounds per mode on the `--spin` plane, differences
@@ -422,10 +421,19 @@ that metric). Default p50 — read percentiles, not means.
 
 **`--html FILE`** — a self-contained report (inline CSS/SVG, no network):
 per-resolver percentile tables, one CDF chart per phase overlaying every
-resolver (X log-scaled, v4 solid, v6 dashed), and the anomalies
-breakdown. We needed the CDF the day a resolver's latency turned out
-bimodal: a mean hides it, a percentile table half-hides it, a step in the
-curve shows it.
+resolver (X log-scaled), and the anomalies breakdown. We needed the CDF
+the day a resolver's latency turned out bimodal: a mean hides it, a
+percentile table half-hides it, a step in the curve shows it.
+
+A colour is a server, not a rank. Entries whose names differ only by a
+`-v6`, `-v4`, `-tcp` or `-udp` suffix share it, and it is the same in
+the HIT and the MISS chart; the line style carries the rest — v4 solid,
+v6 dashed, and in a panel that mixes transports TCP dotted. The palette
+stops at eight hues, ordered so that neighbouring ones stay apart for
+colour-deficient readers too: a ninth server opens a second chart on the
+same axes rather than borrow a colour. Our first reports on larger panels showed four of
+twelve colours twice, and a MISS axis with a single mark on it; both are
+gone since 2.5.1. Hovering a curve names it.
 
 **`--json FILE`**, **`--csv FILE`** — the same results, for machines. Our
 campaign runner used to rebuild a summary table by scraping the console
@@ -521,7 +529,8 @@ section is the whole error story: 0 REFUSED, 0 SERVFAIL, four timeouts in
 
 The same panel as an HTML report (`--html`), this time from the macOS
 client on the default plane — 14 resolvers, 2000 rounds, an evening in
-August. Full report: [docs/report-full.png](docs/report-full.png).
+August (the 2.3 rendering, one colour per curve; since 2.5.1 a colour is
+a server). Full report: [docs/report-full.png](docs/report-full.png).
 
 ![dnsbench HTML report: cache-HIT table and CDF](docs/report-hit.png)
 
@@ -564,7 +573,8 @@ right. The anomalies section lists, per resolver, everything that was
 excluded from the samples and why.
 
 **Reading the CDF curves.** A curve further left is faster; percentiles
-read off directly (X is log-scaled, v4 solid, v6 dashed). Steps mean a
+read off directly (X is log-scaled; one colour per server, v4 solid, v6
+dashed, TCP dotted next to UDP). Steps mean a
 *multimodal* latency: a plateau is a band with almost no samples, a steep
 rise is a mode. Usual causes on public resolvers: anycast/multi-POP
 variance, cache tiers (edge hit vs core recursion), aggressive negative
