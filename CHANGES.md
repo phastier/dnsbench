@@ -94,6 +94,46 @@ a symmetric, deterministic semi-cold state — the family comparison at
 equal thermal conditions, with no randomness). The header and the HTML
 report identify themselves (order/family).
 
+## v2.4 — machine-readable output (--json, --csv)
+
+The campaign runners rebuilt a `summary.csv` by scraping the console
+tables with awk — column positions, an `err` column that v1 did not
+have. The instrument now writes its results itself.
+
+**`--json FILE`.** The whole run as one document, under a versioned
+schema (`"schema": 1`): tool version, `--label`, UTC start time, elapsed
+time, every option that shapes the measurement (rounds, mode, parallel,
+timeout, gap, EDNS, qtype, order, family, spin/rt/kts/pin, the `vs`
+metric), the hit domains with their effective qtype, the MISS base, the
+clock calibration, then one object per resolver — name, address, family —
+with a `hit` and/or `miss` phase: `n`, `fail`, `err`, the anomaly
+breakdown (`timeouts`, `net_errors`, `rcodes` by name), the statistics
+of the console and `vs`. Durations are integer
+nanoseconds (`"unit": "ns"`), not rounded to the console's microsecond;
+statistics are `null` when a phase collected no sample, where the console
+prints 0.000. `kts` reports the plane actually in effect (it can
+self-disable), `pin` is `null` on Darwin where the flag is ignored.
+Resolvers come in configuration order, whatever `--sort` says.
+
+**`--samples`.** Adds every raw sample to the JSON, in measurement order
+(failed queries are not in the series): a distribution can be re-plotted,
+and the time structure of a run is no longer lost in the percentiles.
+
+**`--csv FILE`.** The two console tables, same columns, same formatting
+(ms), one row per resolver and mode, in console order: `run, mode,
+resolver, n, fail, err, min, p50, p90, p99, p999, max, mean, std, vs` —
+the layout of the scraped `summary.csv`, so earlier campaign files and
+new ones concatenate. `run` is the `--label`, or the UTC start time when
+none is given: every row says which run it belongs to. RFC 4180 quoting
+where a field needs it.
+
+**`--label TEXT`.** Names the run (JSON `label`, CSV `run`).
+
+`-` as FILE writes to stdout; the console report then moves to stderr,
+so `dnsbench --json - | jq` is a clean pipe (one of `--json` / `--csv`
+at a time). Hand-written serializers, no Foundation. Pure output: the
+measurement paths are those of 2.3.
+
 ## Measurement validity
 
 **Late-reply drain (the v1 cascade bug).** In sequential mode, a reply
@@ -215,7 +255,7 @@ binaries (v1 arm64 already produced, v2 via `make linux-arm64`).
 
 ## Deferred (v2.x)
 
-`--json`/`--csv` output, then a Prometheus textfile collector; `--bind`.
+A Prometheus textfile collector (`--json` and `--csv` landed in 2.4); `--bind`.
 DoT/DoH: non-goal (zero dependencies). Deliberately set aside: io_uring
 SQPOLL (a Linux-only architecture change for 1–2 µs already below the
 `--kts` floor), TX timestamps (`MSG_ERRQUEUE`, disproportionate

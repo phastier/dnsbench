@@ -28,10 +28,13 @@
 //     server wake-up ("first of the pair pays"); --fixed-order restores v2.2;
 //     -4/-6 family filters and --order shuffle|conf|v4-first|v6-first
 //   - new: --timeout-ms, --gap (pacing), --spin, --edns, --rt, --verbose
+//   - v2.4: machine-readable output - --json (the whole run, versioned schema,
+//     integer nanoseconds), --csv (the summary tables), --samples, --label
 //
 // Build: see Makefile (swiftc -O dnsbench.swift -o dnsbench).
 // Usage: ./dnsbench [-c FILE] [--rounds N] [--qtype A|AAAA|HTTPS|N] [--mode hit|miss|both]
-//                   [--sort KEY] [--html FILE] [--gap MS] [--spin] [--edns] [--rt] [-v] [-h]
+//                   [--sort KEY] [--html FILE] [--json FILE] [--csv FILE]
+//                   [--gap MS] [--spin] [--edns] [--rt] [-v] [-h]
 
 #if canImport(Darwin)
 import Darwin
@@ -44,7 +47,7 @@ import Glibc
 let SOCK_DGRAM_VAL = Int32(SOCK_DGRAM.rawValue)   // enum on Glibc
 #endif
 
-let VERSION = "2.3"
+let VERSION = "2.4"
 
 // ───────────────────────────── Monotonic clock ─────────────────────────────
 @inline(__always)
@@ -908,12 +911,164 @@ func writeHTML(_ path: String, _ cfg: Config, _ names: [String], _ isV6: [Bool],
     fputs("HTML written: \(path)\n", stderr)
 }
 
+// ───────────────────── Machine-readable output (JSON, CSV) ─────────────────────
+// The console tables, for scripts and dashboards. JSON carries the whole run
+// (options, clock, per-resolver statistics, anomaly breakdown and, with
+// --samples, every raw sample in measurement order) in integer nanoseconds
+// under a versioned schema. CSV carries the two summary tables formatted
+// exactly like the console (ms, same columns), one row per resolver and mode.
+// Hand-written serializers: no Foundation, so no JSONEncoder.
+var machineFd: Int32 = -1           // the real stdout, when "-" hands it to --json/--csv
+
+func modeName(_ m: Mode) -> String { m == .both ? "both" : (m == .hit ? "hit" : "miss") }
+func orderName() -> String {
+    switch visitOrder {
+    case .shuffle: return "shuffle"
+    case .conf: return "conf"
+    case .v4First: return "v4-first"
+    case .v6First: return "v6-first"
+    }
+}
+
+// RFC 3339, UTC: machine output must not depend on the probe's timezone.
+func utcStamp() -> String {
+    var t = time(nil); var tmv = tm()
+    gmtime_r(&t, &tmv)
+    var buf = [CChar](repeating: 0, count: 32)
+    let n = strftime(&buf, buf.count, "%Y-%m-%dT%H:%M:%SZ", &tmv)
+    return n > 0 ? String(cString: buf) : ""
+}
+
+func writeOutput(_ path: String, _ text: String, _ what: String) {
+    let toStdout = path == "-"
+    let fd = toStdout ? machineFd : open(path, O_WRONLY | O_CREAT | O_TRUNC, mode_t(0o644))
+    if fd < 0 { fputs("dnsbench: cannot write \(what): \(path)\n", stderr); return }
+    defer { if !toStdout { close(fd) } }
+    let bytes = Array(text.utf8)
+    var off = 0
+    while off < bytes.count {
+        let n = bytes.withUnsafeBytes { write(fd, $0.baseAddress! + off, $0.count - off) }
+        if n < 0 {
+            if errno == EINTR { continue }
+            fputs("dnsbench: write error on \(what): \(path)\n", stderr); return
+        }
+        off += n
+    }
+    if !toStdout { fputs("\(what) written: \(path)\n", stderr) }
+}
+
+func jsonString(_ s: String) -> String {
+    var o = "\""
+    for u in s.unicodeScalars {
+        switch u.value {
+        case 0x22: o += "\\\""
+        case 0x5C: o += "\\\\"
+        case 0x0A: o += "\\n"
+        case 0x0D: o += "\\r"
+        case 0x09: o += "\\t"
+        case 0..<0x20:
+            let h = String(u.value, radix: 16)
+            o += "\\u" + String(repeating: "0", count: 4 - h.count) + h
+        default: o.unicodeScalars.append(u)
+        }
+    }
+    return o + "\""
+}
+
+// One phase of one resolver. Statistics are null when no sample was collected
+// (the console prints 0.000 there); `vs` is the console ratio, as a number.
+func jsonPhase(_ a: Acc, _ best: UInt64, _ refMetric: SortKey, _ withSamples: Bool) -> String {
+    var s = a.samples; s.sort()
+    let (mean, std) = meanStd(s)
+    func v(_ x: UInt64) -> String { s.isEmpty ? "null" : String(x) }
+    var rcodes = [String]()
+    for rc in 0..<16 where a.rcodeCounts[rc] > 0 { rcodes.append("\(jsonString(rcodeName(rc))): \(a.rcodeCounts[rc])") }
+    let ratio = ratioStr(sortValue(a, refMetric), best)
+    var o = "{\"n\": \(s.count), \"fail\": \(a.fails), \"err\": \(a.rcodeErrs), \"timeouts\": \(a.timeouts), "
+    o += "\"net_errors\": \(a.netErrs), \"rcodes\": {\(rcodes.joined(separator: ", "))}, "
+    o += "\"min\": \(v(percentile(s, 0))), \"p50\": \(v(percentile(s, 50))), \"p90\": \(v(percentile(s, 90))), "
+    o += "\"p99\": \(v(percentile(s, 99))), \"p999\": \(v(percentile(s, 99.9))), \"max\": \(v(percentile(s, 100))), "
+    o += "\"mean\": \(v(mean)), \"std\": \(v(std)), \"vs\": \(ratio == "-" ? "null" : String(ratio.dropLast()))"
+    if withSamples { o += ", \"samples\": [" + a.samples.map { String($0) }.joined(separator: ",") + "]" }
+    return o + "}"
+}
+
+func writeJSON(_ path: String, _ cfg: Config, _ names: [String], _ addrs: [String], _ isV6: [Bool],
+               _ hit: [Acc], _ miss: [Acc], _ refMetric: SortKey, _ clkCost: UInt64, _ clkRes: UInt64,
+               _ started: String, _ elapsedNs: UInt64) {
+    let doHit = cfg.mode != .miss, doMiss = cfg.mode != .hit
+    let hBest = bestValue(hit, refMetric), mBest = bestValue(miss, refMetric)
+#if canImport(Darwin)
+    let pin = "null"                                   // --pin is ignored on Darwin
+#else
+    let pin = pinCore.map { String($0) } ?? "null"
+#endif
+    var d = "{\n  \"schema\": 1,\n  \"tool\": \"dnsbench\",\n  \"version\": \(jsonString(VERSION)),\n"
+    d += "  \"label\": \(runLabel.map(jsonString) ?? "null"),\n"
+    d += "  \"started\": \(jsonString(started)),\n  \"elapsed_ms\": \(elapsedNs / 1_000_000),\n  \"unit\": \"ns\",\n"
+    d += "  \"options\": {\"config\": \(jsonString(configPath)), \"rounds\": \(cfg.rounds), \"mode\": \"\(modeName(cfg.mode))\", "
+    d += "\"parallel\": \(cfg.parallel), \"timeout_ms\": \(cfg.timeoutMs), \"gap_ms\": \(cfg.gapMs), \"edns\": \(cfg.edns), "
+    d += "\"qtype\": \(jsonString(qtypeName(cfg.qtype))), \"order\": \"\(orderName())\", "
+    d += "\"family\": \"\(familyOnly == AF_INET ? "v4" : (familyOnly == AF_INET6 ? "v6" : "any"))\", "
+    d += "\"spin\": \(spinFlag), \"rt\": \(rtFlag), \"kts\": \(ktsActive), \"pin\": \(pin), "
+    d += "\"vs_metric\": \"\(metricName(refMetric))\"},\n"
+    d += "  \"hit_domains\": [" + cfg.hitDomains.map {
+        "{\"name\": \(jsonString($0.name)), \"qtype\": \(jsonString(qtypeName($0.qtype ?? cfg.qtype)))}"
+    }.joined(separator: ", ") + "],\n"
+    d += "  \"miss_base\": \(jsonString(cfg.missBase)),\n"
+    d += "  \"clock\": {\"cost_ns\": \(clkCost), \"resolution_ns\": \(clkRes)},\n  \"resolvers\": [\n"
+    for i in names.indices {
+        d += "    {\"name\": \(jsonString(names[i])), \"address\": \(jsonString(addrs[i])), \"family\": \"\(isV6[i] ? "v6" : "v4")\""
+        if doHit { d += ",\n     \"hit\": " + jsonPhase(hit[i], hBest, refMetric, samplesFlag) }
+        if doMiss { d += ",\n     \"miss\": " + jsonPhase(miss[i], mBest, refMetric, samplesFlag) }
+        d += i == names.count - 1 ? "}\n" : "},\n"
+    }
+    d += "  ]\n}\n"
+    writeOutput(path, d, "JSON")
+}
+
+// RFC 4180 quoting, only where a field needs it.
+func csvField(_ s: String) -> String {
+    if !s.unicodeScalars.contains(where: { $0 == "," || $0 == "\"" || $0 == "\n" || $0 == "\r" }) { return s }
+    var o = "\""
+    for u in s.unicodeScalars { if u == "\"" { o += "\"\"" } else { o.unicodeScalars.append(u) } }
+    return o + "\""
+}
+
+func csvRows(_ run: String, _ mode: String, _ accs: [Acc], _ names: [String], _ ord: [Int], _ refMetric: SortKey) -> String {
+    let best = bestValue(accs, refMetric)
+    var o = ""
+    for i in ord {
+        let a = accs[i]; var s = a.samples; s.sort()
+        let (mean, std) = meanStd(s)
+        let f = [run, mode, csvField(names[i]), "\(s.count)", "\(a.fails)", "\(a.rcodeErrs)",
+                 msStr(percentile(s, 0)), msStr(percentile(s, 50)), msStr(percentile(s, 90)),
+                 msStr(percentile(s, 99)), msStr(percentile(s, 99.9)), msStr(percentile(s, 100)),
+                 msStr(mean), msStr(std), ratioStr(sortValue(a, refMetric), best)]
+        o += f.joined(separator: ",") + "\n"
+    }
+    return o
+}
+
+// Rows follow the console order (--sort). `run` is the --label, or the run's
+// start time when none was given: every row says which run it belongs to, so
+// the files of a campaign concatenate into one table.
+func writeCSV(_ path: String, _ cfg: Config, _ names: [String], _ hit: [Acc], _ miss: [Acc],
+              _ hOrd: [Int], _ mOrd: [Int], _ refMetric: SortKey, _ started: String) {
+    let run = csvField(runLabel ?? started)
+    var d = "run,mode,resolver,n,fail,err,min,p50,p90,p99,p999,max,mean,std,vs\n"
+    if cfg.mode != .miss { d += csvRows(run, "HIT", hit, names, hOrd, refMetric) }
+    if cfg.mode != .hit { d += csvRows(run, "MISS", miss, names, mOrd, refMetric) }
+    writeOutput(path, d, "CSV")
+}
+
 // ───────────────────────────── CLI ─────────────────────────────
 func usage() {
     fputs("""
     usage: dnsbench [-c FILE] [--rounds N] [--qtype A|AAAA|HTTPS|N] [--mode hit|miss|both]
                     [--timeout-ms N] [--gap MS] [--spin] [--edns] [--rt] [--kts] [--pin N]
-                    [--sort KEY] [--html FILE] [-v] [-h] [--version]
+                    [--sort KEY] [--html FILE] [--json FILE] [--csv FILE] [--samples]
+                    [--label TEXT] [-v] [-h] [--version]
       -c, --config FILE      configuration file (default: ./dnsbench.conf)
           --rounds N         override the round count (quick smoke test)
           --qtype T          override the global query type (A, AAAA, HTTPS, TXT or numeric)
@@ -941,6 +1096,14 @@ func usage() {
                              editing the conf (mutually exclusive)
           --sort KEY         sort + vs-ratio on min|p50|p90|p99|p999|max|mean
           --html FILE        also write a standalone HTML report (tables + CDF charts)
+          --json FILE        also write the whole run as JSON (versioned schema,
+                             integer nanoseconds); "-" writes it to stdout and
+                             moves the console report to stderr
+          --csv FILE         also write the summary tables as CSV (console columns
+                             and units, one row per resolver and mode); "-" as above
+          --samples          with --json: include every raw sample, in measurement order
+          --label TEXT       name this run: JSON `label`, CSV `run` column (default:
+                             the start time)
       -v, --verbose          echo parsed resolver addresses at startup
           --version          print version and exit
       -h, --help             show this help and exit
@@ -964,6 +1127,10 @@ var pinCore: Int? = nil
 var verboseFlag = false
 var sortKey: SortKey? = nil
 var htmlPath: String? = nil
+var jsonPath: String? = nil
+var csvPath: String? = nil
+var samplesFlag = false
+var runLabel: String? = nil
 var it = CommandLine.arguments.dropFirst().makeIterator()
 while let a = it.next() {
     switch a {
@@ -1025,6 +1192,17 @@ while let a = it.next() {
     case "--html":
         guard let v = it.next() else { fputs("dnsbench: --html requires a file path\n", stderr); exit(2) }
         htmlPath = v
+    case "--json":
+        guard let v = it.next() else { fputs("dnsbench: --json requires a file path (or -)\n", stderr); exit(2) }
+        jsonPath = v
+    case "--csv":
+        guard let v = it.next() else { fputs("dnsbench: --csv requires a file path (or -)\n", stderr); exit(2) }
+        csvPath = v
+    case "--samples":
+        samplesFlag = true
+    case "--label":
+        guard let v = it.next() else { fputs("dnsbench: --label requires a text\n", stderr); exit(2) }
+        runLabel = v
     case "--version":
         print("dnsbench \(VERSION)"); exit(0)
     case "-h", "--help":
@@ -1036,6 +1214,17 @@ while let a = it.next() {
 }
 
 // ───────────────────────────── Main ─────────────────────────────
+// "-" hands stdout to the machine-readable output: the console report moves to
+// stderr, so that `dnsbench --json - | jq .` stays a clean pipe.
+if jsonPath == "-" && csvPath == "-" {
+    fputs("dnsbench: only one of --json and --csv can write to stdout\n", stderr); exit(2)
+}
+if jsonPath == "-" || csvPath == "-" {
+    machineFd = dup(1)
+    dup2(2, 1)
+}
+if samplesFlag && jsonPath == nil { fputs("dnsbench: --samples only applies to --json, ignored\n", stderr) }
+
 guard var cfg = loadConfig(configPath) else { fputs("dnsbench: cannot read config: \(configPath)\n", stderr); exit(1) }
 if let r = roundsOverride { cfg.rounds = r }
 if let q = qtypeOverride { cfg.qtype = q }
@@ -1081,6 +1270,7 @@ let recvCap = 2048                                     // > EDNS0 bufsize 1232
 var recvBuf = [UInt8](repeating: 0, count: recvCap)
 
 var fds = [Int32](); var names = [String](); var isV6 = [Bool]()
+var addrs = [String]()                                 // as written in the conf (JSON output)
 var skippedFamily = 0
 for r in cfg.resolvers {
     guard let (ss, len, fam) = resolveSockaddr(r.ip, 53) else {
@@ -1114,7 +1304,7 @@ for r in cfg.resolvers {
         }
     }
 #endif
-    fds.append(fd); names.append(r.name); isV6.append(fam == AF_INET6)
+    fds.append(fd); names.append(r.name); addrs.append(r.ip); isV6.append(fam == AF_INET6)
     if verboseFlag {
         var dbgSS = ss
         var dbgHost = [CChar](repeating: 0, count: 64)
@@ -1151,6 +1341,7 @@ var rng = XorShift64(seed: monotonicNanos() ^ (UInt64(bitPattern: Int64(getpid()
 
 let (clkCost, clkRes) = clockCalibration()
 let doHit = cfg.mode != .miss, doMiss = cfg.mode != .hit
+let startedStamp = utcStamp()
 print("dnsbench v\(VERSION) - \(fds.count) resolvers, \(cfg.rounds) rounds/mode, mode=\(cfg.mode == .both ? "both" : (cfg.mode == .hit ? "hit" : "miss"))\(cfg.parallel ? " (parallel)" : "")\(spinFlag ? " (spin)" : "")\(cfg.edns ? " (edns)" : "")\(ktsActive ? " (kts)" : "")\(orderMark())\(familyOnly == AF_INET ? " (v4 only)" : (familyOnly == AF_INET6 ? " (v6 only)" : "")), "
     + "timeout \(cfg.timeoutMs) ms\(cfg.gapMs > 0 ? ", gap \(cfg.gapMs) ms" : ""), \(cfg.hitDomains.count) hit domain(s), default qtype=\(qtypeName(cfg.qtype)), vs/sort=\(metricName(refMetric))")
 print("clock: ~\(clkCost) ns/call, resolution \(clkRes) ns")
@@ -1266,6 +1457,7 @@ for round in 0..<cfg.rounds {
         }
     }
 }
+let elapsedNs = monotonicNanos() &- runStart
 showProgress(cfg.rounds - 1)
 fputs("\n\n", stderr)
 
@@ -1295,6 +1487,12 @@ if anomalyLines.isEmpty {
 if let hp = htmlPath {
     let hOrd = ordering(hit, sortKey ?? .p50), mOrd = ordering(miss, sortKey ?? .p50)
     writeHTML(hp, cfg, names, isV6, hit, miss, hOrd, mOrd, refMetric, clkCost, clkRes)
+}
+if let jp = jsonPath {
+    writeJSON(jp, cfg, names, addrs, isV6, hit, miss, refMetric, clkCost, clkRes, startedStamp, elapsedNs)
+}
+if let cp = csvPath {
+    writeCSV(cp, cfg, names, hit, miss, hitOrd, missOrd, refMetric, startedStamp)
 }
 
 for fd in fds where fd >= 0 { close(fd) }
